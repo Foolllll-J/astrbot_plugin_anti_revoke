@@ -192,7 +192,7 @@ class AntiRevoke(Star):
         self.instance_id = "AntiRevoke"
         self.cache_expiration_time = int(config.get("cache_expiration_time", 300))
         self.context = context
-        self.temp_path = Path(StarTools.get_data_dir()) / "anti_revoke_data"
+        self.temp_path = Path(StarTools.get_data_dir("astrbot_plugin_anti_revoke"))
         self.temp_path.mkdir(exist_ok=True)
         self.video_cache_path = self.temp_path / "videos"
         self.video_cache_path.mkdir(exist_ok=True)
