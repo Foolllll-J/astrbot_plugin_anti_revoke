@@ -20,5 +20,15 @@
       "type": "int",
       "default": 300,
       "description": "视频和文件大小阈值，单位: MB。超过此大小的视频和文件将不会被缓存 (设为0表示不限制)"
+    },
+    "forward_relay_group": {
+      "type": "string",
+      "default": "",
+      "description": "合并转发中转群号。填写后，收到的合并转发消息会自动转发到此群，撤回时再转发给接收者。留空则保持原有提示"
+    },
+    "auto_recall_relay": {
+      "type": "bool",
+      "default": true,
+      "description": "是否在缓存过期后自动撤回中转群的消息 (建议将Bot设置为管理员)"
     }
 }

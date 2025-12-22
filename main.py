@@ -89,7 +89,8 @@ def _deserialize_components(comp_dicts: List[Dict]) -> List:
             except Exception as e:
                 logger.error(f"[AntiRevoke] 反序列化组件 {comp_type_name} 失败: {e}")
         else:
-            logger.warning(f"[AntiRevoke] 反序列化时遇到未知组件类型 '{comp_type_name}'，已跳过。")
+            if comp_type_name != 'Forward':
+                logger.warning(f"[AntiRevoke] 反序列化时遇到未知组件类型 '{comp_type_name}'，已跳过。")
     return components
 
 
@@ -185,7 +186,7 @@ async def _process_component_and_get_gocq_part(
     return gocq_parts
 
 @register(
-    "astrbot_plugin_anti_revoke", "Foolllll", "监控撤回插件", "0.3",
+    "astrbot_plugin_anti_revoke", "Foolllll", "监控撤回插件", "1.0",
     "https://github.com/Foolllll-J/astrbot_plugin_anti_revoke",
 )
 class AntiRevoke(Star):
@@ -197,6 +198,8 @@ class AntiRevoke(Star):
         self.instance_id = "AntiRevoke"
         self.cache_expiration_time = int(config.get("cache_expiration_time", 300))
         self.file_size_threshold_mb = int(config.get("file_size_threshold_mb", 300))
+        self.forward_relay_group = str(config.get("forward_relay_group", "") or "")
+        self.auto_recall_relay = config.get("auto_recall_relay", True)
         self.context = context
         self.temp_path = Path(StarTools.get_data_dir("astrbot_plugin_anti_revoke"))
         self.temp_path.mkdir(exist_ok=True)
@@ -204,6 +207,7 @@ class AntiRevoke(Star):
         self.video_cache_path.mkdir(exist_ok=True)
         self.file_cache_path = self.temp_path / "files"
         self.file_cache_path.mkdir(exist_ok=True)
+        self.forward_msg_map = {}
         self._cleanup_cache_on_startup()
     
     async def _download_video_from_url(self, url: str, save_path: Path) -> bool:
@@ -236,6 +240,15 @@ class AntiRevoke(Star):
                      continue
         logger.info(f"[{self.instance_id}] 缓存清理完成，移除了 {expired_count} 个过期文件。")
 
+    async def _auto_recall_relay_msg(self, client, relay_msg_id: int):
+        """自动撤回中转群的消息"""
+        await asyncio.sleep(self.cache_expiration_time)
+        try:
+            await client.api.call_action("delete_msg", message_id=relay_msg_id)
+            logger.debug(f"[{self.instance_id}] 已自动撤回中转群消息 ID: {relay_msg_id}")
+        except Exception as e:
+            logger.error(f"[{self.instance_id}] 自动撤回中转群消息失败 (ID: {relay_msg_id}): {e}")
+
     async def terminate(self):
         logger.info(f"[{self.instance_id}] 插件已卸载/重载。")
         
@@ -243,11 +256,136 @@ class AntiRevoke(Star):
     @filter.event_message_type(filter.EventMessageType.ALL, priority=20)
     async def handle_message_cache(self, event: AstrMessageEvent):
         group_id = str(event.get_group_id())
-        message_id = event.message_obj.message_id
+        message_id = str(event.message_obj.message_id)
         if event.get_message_type() != MessageType.GROUP_MESSAGE or group_id not in self.monitor_groups:
             return None
         
+        relay_info = None
         try:
+            # 检查是否是合并转发消息
+            raw_message = event.message_obj.raw_message
+            message_list = raw_message.get("message", [])
+            is_forward = (message_list and len(message_list) > 0 and message_list[0].get("type") == "forward")
+            
+            if is_forward and self.forward_relay_group:
+                # 转发到中转群
+                logger.info(f"[{self.instance_id}] 检测到合并转发消息，准备转发到中转群 {self.forward_relay_group}，原消息ID: {message_id}")
+                try:
+                    client = event.bot
+                    relay_result = await client.api.call_action(
+                        "forward_group_single_msg",
+                        group_id=int(self.forward_relay_group),
+                        message_id=message_id
+                    )
+                    
+                    # 处理不同的返回类型
+                    relay_msg_id = None
+                    if isinstance(relay_result, dict):
+                        relay_msg_id = relay_result.get("message_id")
+                    elif isinstance(relay_result, int):
+                        relay_msg_id = relay_result
+                    
+                    # 如果没有获取到 message_id，通过查询群历史消息获取
+                    if not relay_msg_id:
+                        logger.debug(f"[{self.instance_id}] API 未返回消息ID，尝试通过查询群历史消息获取...")
+                        await asyncio.sleep(1)  # 等待1秒确保消息已发送
+                        
+                        try:
+                            # 尝试获取自身ID以过滤消息
+                            self_id = None
+                            try:
+                                login_info = await client.api.call_action("get_login_info")
+                                self_id = str(login_info.get("user_id"))
+                            except Exception:
+                                pass
+
+                            target_timestamp = event.message_obj.timestamp
+                            found_msg = None
+                            next_seq = 0
+                            
+                            # 循环获取历史消息，直到找到或超出时间范围
+                            for _ in range(5): # 最多尝试5次分页
+                                history_result = await client.api.call_action(
+                                    "get_group_msg_history",
+                                    group_id=int(self.forward_relay_group),
+                                    message_seq=next_seq,
+                                    count=20
+                                )
+                                
+                                messages = []
+                                if isinstance(history_result, dict):
+                                    messages = history_result.get("data", {}).get("messages", [])
+                                    if not messages:
+                                        messages = history_result.get("messages", [])
+                                
+                                if not messages:
+                                    break
+                                    
+                                # 倒序遍历（从新到旧）
+                                for msg in reversed(messages):
+                                    # 检查发送者
+                                    msg_sender_id = str(msg.get("sender", {}).get("user_id", ""))
+                                    if not msg_sender_id:
+                                        msg_sender_id = str(msg.get("user_id", ""))
+                                        
+                                    if self_id and msg_sender_id != self_id:
+                                        continue
+                                        
+                                    # 检查时间 (精确匹配，已确认)
+                                    msg_time = int(msg.get("time", 0))
+                                    if msg_time == target_timestamp:
+                                        found_msg = msg
+                                        break
+                                
+                                if found_msg:
+                                    break
+                                    
+                                # 准备下一次分页
+                                oldest_msg = messages[0]
+                                next_seq = oldest_msg.get("message_seq")
+                                oldest_time = int(oldest_msg.get("time", 0))
+                                
+                                # 如果获取到的最旧消息时间已经超过缓存过期时间（相对于目标时间），则停止搜索
+                                # 这里假设目标消息不会比当前搜索到的最旧消息还旧太多
+                                if target_timestamp - oldest_time > self.cache_expiration_time:
+                                    logger.warning(f"[{self.instance_id}] 搜索范围已超过缓存过期时间，停止搜索。")
+                                    break
+                                    
+                                if next_seq == 0: # 防止死循环
+                                    break
+
+                            if found_msg:
+                                relay_msg_id = found_msg.get("message_id")
+                                relay_msg_time = found_msg.get("time")
+                                logger.debug(f"[{self.instance_id}] 通过时间戳匹配获取到中转消息ID: {relay_msg_id}")
+                            else:
+                                logger.warning(f"[{self.instance_id}] 未在历史消息中找到匹配的机器人发送记录")
+                                
+                        except Exception as e:
+                            logger.error(f"[{self.instance_id}] 查询历史消息失败: {e}")
+                    
+                    if relay_msg_id:
+                        # 保存映射关系: 原消息ID -> 中转群消息ID
+                        relay_info = {
+                            "relay_msg_id": relay_msg_id,
+                            "sender_id": event.get_sender_id(),
+                            "timestamp": event.message_obj.timestamp,
+                            "relay_timestamp": relay_msg_time, # 记录中转消息的实际时间戳
+                            "group_id": group_id
+                        }
+                        self.forward_msg_map[message_id] = relay_info
+                        logger.info(f"[{self.instance_id}] 合并转发成功，已记录映射关系")
+                        
+                        # 设置自动撤回任务
+                        if self.auto_recall_relay:
+                            logger.debug(f"[{self.instance_id}] 启动自动撤回任务，将在 {self.cache_expiration_time} 秒后撤回中转消息")
+                            asyncio.create_task(self._auto_recall_relay_msg(client, relay_msg_id))
+                    else:
+                        logger.warning(f"[{self.instance_id}] 无法获取中转消息ID，该消息的撤回检测将不可用")
+                    
+                except Exception as e:
+                    logger.error(f"[{self.instance_id}] ❌ 转发合并消息到中转群失败: {e}\n{traceback.format_exc()}")
+            
             message_obj = event.get_messages()
             timestamp_ms = int(time.time() * 1000)
             components = message_obj.components if isinstance(message_obj, MessageChain) else message_obj if isinstance(message_obj, list) else []
@@ -258,7 +396,6 @@ class AntiRevoke(Star):
             raw_file_sizes = {}
             raw_video_sizes = {}
             try:
-                raw_message = event.message_obj.raw_message
                 message_list = raw_message.get("message", [])
                 for segment in message_list:
                     if segment.get("type") == "file":
@@ -387,7 +524,8 @@ class AntiRevoke(Star):
                     "components": _serialize_components(components),
                     "sender_id": event.get_sender_id(),
                     "timestamp": event.message_obj.timestamp,
-                    "local_file_map": local_file_map
+                    "local_file_map": local_file_map,
+                    "relay_info": relay_info
                 }
                 json.dump(data_to_save, f, ensure_ascii=False, indent=2)
 
@@ -404,15 +542,95 @@ class AntiRevoke(Star):
         post_type = get_value(raw_message, "post_type")
         if post_type == "notice" and get_value(raw_message, "notice_type") == "group_recall":
             group_id = str(get_value(raw_message, "group_id"))
-            message_id = get_value(raw_message, "message_id")
+            message_id = str(get_value(raw_message, "message_id"))
             if group_id not in self.monitor_groups or not message_id: return None
             
-            file_path: Path = next(self.temp_path.glob(f"*_{group_id}_{message_id}.json"), None)
-            if file_path and file_path.exists():
-                local_files_to_cleanup = [] 
+            # 尝试获取消息数据（优先内存映射，其次本地缓存）
+            relay_info = self.forward_msg_map.pop(message_id, None)
+            cached_data = None
+            file_path = next(self.temp_path.glob(f"*_{group_id}_{message_id}.json"), None)
+            
+            if not relay_info and file_path and file_path.exists():
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         cached_data = json.load(f)
+                    relay_info = cached_data.get("relay_info")
+                except Exception as e:
+                    logger.warning(f"[{self.instance_id}] 读取本地缓存失败: {e}")
+
+            # 如果是合并转发消息（存在 relay_info）
+            if relay_info:
+                logger.info(f"[{self.instance_id}] 检测到合并转发消息被撤回，原消息ID: {message_id}")
+                sender_id = relay_info["sender_id"]
+                
+                if str(sender_id) in self.ignore_senders:
+                    logger.debug(f"[{self.instance_id}] 发送者 {sender_id} 在忽略列表中，跳过处理")
+                    return None
+                
+                relay_msg_id = relay_info["relay_msg_id"]
+                timestamp = relay_info["timestamp"]
+                
+                try:
+                    client = event.bot
+                    
+                    # 获取群名和用户名
+                    group_name, member_nickname = str(group_id), str(sender_id)
+                    try:
+                        group_info = await client.api.call_action('get_group_info', group_id=int(group_id))
+                        group_name = group_info.get('group_name', group_name)
+                    except: pass
+                    try:
+                        member_info = await client.api.call_action('get_group_member_info', group_id=int(group_id), user_id=int(sender_id))
+                        card, nickname = member_info.get('card', ''), member_info.get('nickname', '')
+                        member_nickname = card or nickname or member_nickname
+                    except: pass
+                    
+                    message_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)) if timestamp else "未知时间"
+                    logger.info(f"[{self.instance_id}] 合并转发撤回 - 群: {group_name}, 发送者: {member_nickname}")
+                    
+                    # 向每个接收者转发
+                    for index, target_id in enumerate(self.target_receivers, 1):
+                        target_id_str = str(target_id)
+                        
+                        # 先发送通知
+                        notification_text = f"【撤回提醒】\n群聊：{group_name} ({group_id})\n发送者：{member_nickname} ({sender_id})\n时间：{message_time_str}\n--------------------\n以下是撤回的聊天记录："
+                        try:
+                            await client.send_private_msg(user_id=int(target_id_str), message=notification_text)
+                            await asyncio.sleep(0.5)
+                        except Exception as e:
+                            logger.error(f"[{self.instance_id}] 发送合并转发通知失败到 {target_id_str}: {e}")
+                            continue
+                        
+                        # 从中转群转发到接收者
+                        try:
+                            forward_result = await client.api.call_action(
+                                "forward_friend_single_msg",
+                                user_id=int(target_id_str),
+                                message_id=relay_msg_id
+                            )
+                            logger.debug(f"[{self.instance_id}] 已将合并转发消息转发给 {target_id_str}")
+                        except Exception as e:
+                            logger.error(f"[{self.instance_id}] 转发合并消息失败到 {target_id_str}: {e}")
+                    
+                    # 立即撤回中转群的消息
+                    if self.auto_recall_relay:
+                        try:
+                            await client.api.call_action("delete_msg", message_id=relay_msg_id)
+                            logger.debug(f"[{self.instance_id}] 已撤回中转群消息 ID: {relay_msg_id}")
+                        except Exception as e:
+                            logger.error(f"[{self.instance_id}] 撤回中转群消息失败: {e}")
+                    
+                except Exception as e:
+                    logger.error(f"[{self.instance_id}] 处理合并转发撤回失败: {e}")
+                
+                return None
+            
+            if cached_data or (file_path and file_path.exists()):
+                local_files_to_cleanup = [] 
+                try:
+                    if not cached_data:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            cached_data = json.load(f)
                     
                     sender_id = cached_data["sender_id"]
                     local_file_map = cached_data.get("local_file_map", {})
