@@ -198,7 +198,7 @@ async def _process_component_and_get_gocq_part(
     return gocq_parts
 
 @register(
-    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.1",
+    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.1.1",
     "https://github.com/Foolllll-J/astrbot_plugin_anti_revoke",
 )
 class AntiRevoke(Star):
@@ -587,7 +587,7 @@ class AntiRevoke(Star):
         message_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)) if timestamp else "未知时间"
         if operator_id == sender_id:
             return f"【撤回提醒】\n群聊：{group_name} ({group_id})\n发送者：{member_nickname} ({sender_id})\n时间：{message_time_str}"
-        else
+        else:
             return f"【撤回提醒】\n群聊：{group_name} ({group_id})\n发送者：{member_nickname} ({sender_id})\n操作者：{operator_nickname} ({operator_id})\n时间：{message_time_str}"
 
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
@@ -716,7 +716,7 @@ class AntiRevoke(Star):
                     timestamp = cached_data.get("timestamp")
                     client = event.bot
                     
-                    group_name, member_nickname,operator_nickname = str(group_id), str(sender_id), str(operator_id)
+                    group_name, member_nickname, operator_nickname = str(group_id), str(sender_id), str(operator_id)
                     try:
                         group_info = await client.api.call_action('get_group_info', group_id=int(group_id)); group_name = group_info.get('group_name', group_name)
                     except: pass
