@@ -1,17 +1,15 @@
+**<div align="center">**    <h2>👀 BIG BROTHER IS WATCHING YOU!</h2> </div>
+
 # 🛡️ QQ防撤回插件
 
-![License](https://img.shields.io/badge/license-GPL--3.0-green)
-![Python](https://img.shields.io/badge/python-3.10+-yellow.svg)
-![AstrBot](https://img.shields.io/badge/framework-AstrBot-blue)
+
+![License](https://img.shields.io/badge/license-AGPL--3.0-green?style=flat-square)
+![Python](https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white)
+![AstrBot](https://img.shields.io/badge/framework-AstrBot-ff6b6b?style=flat-square)
 
 一款为 [**AstrBot**]([AstrBot](https://github.com/AstrBotDevs/AstrBot)) 设计的高可靠性防撤回插件。
 
----
-
-**<div align="center">**    <h2>👀 BIG BROTHER IS WATCHING YOU!</h2> </div>
-------------------------------------
-
-## ⚠️ 注意事项
+## 📖 使用说明
 
 | 项目               | 描述                                                                                                                       |
 | :----------------- | :------------------------------------------------------------------------------------------------------------------------- |
@@ -29,21 +27,32 @@
 | **`ignore_senders`**        | `list[str]` | `[]`  | 忽略这些 QQ 号的撤回消息，不会触发转发。             |
 | **`cache_expiration_time`** | `int`       | `300` | 消息缓存时间，单位: 秒。超过此时间的消息，撤回后将无法恢复。 |
 | **`file_size_threshold_mb`** | `int`       | `300` | 视频和文件大小阈值，单位: MB。超过此大小的视频和文件将不会被缓存（设为 0 表示不限制）。 |
-| **`forward_relay_group`** | `str` | `""` | 中转群号，用于转发合并消息起到缓存作用。若未配置，将无法获取到撤回的合并消息的内容。 |
+| **`forward_to_self`** | `bool` | `false` | 是否转发合并转发消息给机器人自身。开启后，收到的合并转发消息会自动转发给机器人自身私聊。 |
+| **`forward_relay_group`** | `str` | `""` | 中转群号，用于转发合并消息起到缓存作用。 |
 | **`auto_recall_relay`** | `bool` | `True` | 是否自动撤回中转群的消息。 |
+
+## ⚠️ 注意事项
+
+* **语音转文本**：如果会话配置了语音转文本，可能会导致语音消息的撤回监控无法正常工作。
 
 ---
 
-## 📅 版本更新
+## 📅 更新日志
 
-**v1.1.2 (2026-01-10)**
+<details>
+<summary>点击展开更新日志</summary>
 
-- 修正在docker环境下无法正常发送语音的异常
+**v1.1.3**
 
-**v1.1.1 (2026-01-08)**
+- 新增支持将合并转发消息转发给机器人自身。
+
+**v1.1.2**
+
+- 修复在docker环境下可能遇到的文件权限问题。
+
+**v1.1.1**
 
 - 新增被管理员撤回时显示撤回者。
-
 
 **v1.1**
 
@@ -64,6 +73,8 @@
 **v0.1**
 
 * 支持监控文本和图像消息。
+
+</details>
 
 ---
 

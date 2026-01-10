@@ -27,6 +27,12 @@
       "description": "视频和文件大小阈值，单位: MB",
       "hint": "超过此大小的视频和文件将不会被缓存 (设为0表示不限制)"
     },
+    "forward_to_self": {
+      "type": "bool",
+      "default": false,
+      "description": "是否转发合并转发消息给机器人自身",
+      "hint": "开启后，收到的合并转发消息会自动转发给机器人自身私聊。"
+    },
     "forward_relay_group": {
       "type": "string",
       "default": "",

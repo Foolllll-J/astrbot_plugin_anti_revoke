@@ -198,7 +198,7 @@ async def _process_component_and_get_gocq_part(
     return gocq_parts
 
 @register(
-    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.1.2",
+    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.1.3",
     "https://github.com/Foolllll-J/astrbot_plugin_anti_revoke",
 )
 class AntiRevoke(Star):
@@ -212,6 +212,7 @@ class AntiRevoke(Star):
         self.cache_expiration_time = int(config.get("cache_expiration_time", 300))
         self.file_size_threshold_mb = int(config.get("file_size_threshold_mb", 300))
         self.forward_relay_group = str(config.get("forward_relay_group", "") or "")
+        self.forward_to_self = config.get("forward_to_self", False)
         self.auto_recall_relay = config.get("auto_recall_relay", True)
         self.context = context
         self.temp_path = Path(StarTools.get_data_dir("astrbot_plugin_anti_revoke"))
@@ -288,100 +289,138 @@ class AntiRevoke(Star):
                 if isinstance(first_segment, dict) and first_segment.get("type") == "forward":
                     is_forward = True
             
-            if is_forward and self.forward_relay_group:
+            if is_forward and self.forward_to_self:
+                try:
+                    client = event.bot
+                    login_info = await client.api.call_action("get_login_info")
+                    self_id = login_info.get("user_id")
+                    if self_id:
+                        logger.info(f"[{self.instance_id}] 检测到合并转发消息，准备转发给机器人自身 ({self_id})，原消息ID: {message_id}")
+                        await client.api.call_action(
+                            "forward_friend_single_msg",
+                            user_id=int(self_id),
+                            message_id=message_id
+                        )
+                        
+                        relay_msg_id = None
+                        logger.debug(f"[{self.instance_id}] 转发给自身完成，准备通过查询私聊历史消息获取 ID...")
+                        await asyncio.sleep(1)
+                        try:
+                            history_result = await client.api.call_action(
+                                "get_friend_msg_history",
+                                user_id=int(self_id),
+                                count=10
+                            )
+                            messages = []
+                            if isinstance(history_result, dict):
+                                messages = history_result.get("messages", []) or history_result.get("data", {}).get("messages", [])
+                            
+                            target_timestamp = event.message_obj.timestamp
+                            for msg in reversed(messages):
+                                msg_time = int(msg.get("time", 0))
+                                if abs(msg_time - target_timestamp) <= 2:
+                                    relay_msg_id = msg.get("message_id")
+                                    break
+                        except Exception as e:
+                            logger.warning(f"[{self.instance_id}] 查询自身私聊历史消息失败: {e}")
+                                
+                        if relay_msg_id:
+                            relay_info = {
+                                "relay_msg_id": relay_msg_id,
+                                "sender_id": event.get_sender_id(),
+                                "timestamp": event.message_obj.timestamp,
+                                "group_id": group_id,
+                                "is_private_relay": True # 标记为私聊中转
+                            }
+                            logger.info(f"[{self.instance_id}] 转发给自身成功，已记录映射关系 (ID: {relay_msg_id})")
+                except Exception as e:
+                    logger.error(f"[{self.instance_id}] ❌ 转发合并消息给机器人自身失败: {e}")
+
+            if not relay_info and is_forward and self.forward_relay_group:
                 logger.info(f"[{self.instance_id}] 检测到合并转发消息，准备转发到中转群 {self.forward_relay_group}，原消息ID: {message_id}")
                 try:
                     client = event.bot
-                    relay_result = await client.api.call_action(
+                    await client.api.call_action(
                         "forward_group_single_msg",
                         group_id=int(self.forward_relay_group),
                         message_id=message_id
                     )
                     
-                    # 处理不同的返回类型
                     relay_msg_id = None
-                    if isinstance(relay_result, dict):
-                        relay_msg_id = relay_result.get("message_id")
-                    elif isinstance(relay_result, int):
-                        relay_msg_id = relay_result
+                    logger.info(f"[{self.instance_id}] 转发到中转群完成，准备通过查询群历史消息获取 ID...")
+                    await asyncio.sleep(1)
                     
-                    # 如果没有获取到 message_id，通过查询群历史消息获取
-                    if not relay_msg_id:
-                        logger.debug(f"[{self.instance_id}] API 未返回消息ID，尝试通过查询群历史消息获取...")
-                        await asyncio.sleep(1)
-                        
+                    try:
+                        # 尝试获取自身ID以过滤消息
+                        self_id = None
                         try:
-                            # 尝试获取自身ID以过滤消息
-                            self_id = None
-                            try:
-                                login_info = await client.api.call_action("get_login_info")
-                                self_id = str(login_info.get("user_id"))
-                            except Exception:
-                                pass
+                            login_info = await client.api.call_action("get_login_info")
+                            self_id = str(login_info.get("user_id"))
+                        except Exception:
+                            pass
 
-                            target_timestamp = event.message_obj.timestamp
-                            found_msg = None
-                            next_seq = 0
+                        target_timestamp = event.message_obj.timestamp
+                        found_msg = None
+                        next_seq = 0
+                        
+                        # 循环获取历史消息，直到找到或超出时间范围
+                        for _ in range(5): # 最多尝试5次分页
+                            history_result = await client.api.call_action(
+                                "get_group_msg_history",
+                                group_id=int(self.forward_relay_group),
+                                message_seq=next_seq,
+                                count=20
+                            )
                             
-                            # 循环获取历史消息，直到找到或超出时间范围
-                            for _ in range(5): # 最多尝试5次分页
-                                history_result = await client.api.call_action(
-                                    "get_group_msg_history",
-                                    group_id=int(self.forward_relay_group),
-                                    message_seq=next_seq,
-                                    count=20
-                                )
-                                
-                                messages = []
-                                if isinstance(history_result, dict):
-                                    messages = history_result.get("data", {}).get("messages", [])
-                                    if not messages:
-                                        messages = history_result.get("messages", [])
-                                
+                            messages = []
+                            if isinstance(history_result, dict):
+                                messages = history_result.get("data", {}).get("messages", [])
                                 if not messages:
-                                    await asyncio.sleep(1)
+                                    messages = history_result.get("messages", [])
+                            
+                            if not messages:
+                                await asyncio.sleep(1)
+                                continue
+                                
+                            # 倒序遍历（从新到旧）
+                            for msg in reversed(messages):
+                                msg_sender_id = str(msg.get("sender", {}).get("user_id", ""))
+                                if not msg_sender_id:
+                                    msg_sender_id = str(msg.get("user_id", ""))
+                                    
+                                if self_id and msg_sender_id != self_id:
                                     continue
                                     
-                                # 倒序遍历（从新到旧）
-                                for msg in reversed(messages):
-                                    msg_sender_id = str(msg.get("sender", {}).get("user_id", ""))
-                                    if not msg_sender_id:
-                                        msg_sender_id = str(msg.get("user_id", ""))
-                                        
-                                    if self_id and msg_sender_id != self_id:
-                                        continue
-                                        
-                                    msg_time = int(msg.get("time", 0))
-                                    if abs(msg_time - target_timestamp) <= 1:
-                                        found_msg = msg
-                                        break
-                                
-                                if found_msg:
+                                msg_time = int(msg.get("time", 0))
+                                if abs(msg_time - target_timestamp) <= 1:
+                                    found_msg = msg
                                     break
-                                    
-                                # 准备下一次分页
-                                oldest_msg = messages[0]
-                                next_seq = oldest_msg.get("message_seq")
-                                oldest_time = int(oldest_msg.get("time", 0))
-                                
-                                # 如果获取到的最旧消息时间已经超过缓存过期时间（相对于目标时间），则停止搜索
-                                # 这里假设目标消息不会比当前搜索到的最旧消息还旧太多
-                                if target_timestamp - oldest_time > self.cache_expiration_time:
-                                    logger.warning(f"[{self.instance_id}] 搜索范围已超过缓存过期时间，停止搜索。")
-                                    break
-                                    
-                                if next_seq == 0: # 防止死循环
-                                    break
-
+                            
                             if found_msg:
-                                relay_msg_id = found_msg.get("message_id")
-                                relay_msg_time = found_msg.get("time")
-                                logger.debug(f"[{self.instance_id}] 通过时间戳匹配获取到中转消息ID: {relay_msg_id}")
-                            else:
-                                logger.warning(f"[{self.instance_id}] 未在历史消息中找到匹配的机器人发送记录")
+                                break
                                 
-                        except Exception as e:
-                            logger.error(f"[{self.instance_id}] 查询历史消息失败: {e}")
+                            # 准备下一次分页
+                            oldest_msg = messages[0]
+                            next_seq = oldest_msg.get("message_seq")
+                            oldest_time = int(oldest_msg.get("time", 0))
+                            
+                            # 如果获取到的最旧消息时间已经超过缓存过期时间（相对于目标时间），则停止搜索
+                            if target_timestamp - oldest_time > self.cache_expiration_time:
+                                logger.warning(f"[{self.instance_id}] 搜索范围已超过缓存过期时间，停止搜索。")
+                                break
+                                
+                            if next_seq == 0: # 防止死循环
+                                break
+
+                        if found_msg:
+                            relay_msg_id = found_msg.get("message_id")
+                            relay_msg_time = found_msg.get("time")
+                            logger.debug(f"[{self.instance_id}] 通过时间戳匹配获取到中转消息ID: {relay_msg_id}")
+                        else:
+                            logger.warning(f"[{self.instance_id}] 未在历史消息中找到匹配的机器人发送记录")
+                                
+                    except Exception as e:
+                        logger.error(f"[{self.instance_id}] 查询历史消息失败: {e}")
                     
                     if relay_msg_id:
                         # 保存映射关系: 原消息ID -> 中转群消息ID
@@ -685,8 +724,8 @@ class AntiRevoke(Star):
                         except Exception as e:
                             logger.error(f"[{self.instance_id}] 转发合并消息失败到 {target_type} {target_id_str}: {e}")
                     
-                    # 立即撤回中转群的消息
-                    if self.auto_recall_relay:
+                    # 立即撤回中转群的消息 (如果是私聊中转则不撤回)
+                    if self.auto_recall_relay and not relay_info.get("is_private_relay"):
                         try:
                             await client.api.call_action("delete_msg", message_id=relay_msg_id)
                             logger.debug(f"[{self.instance_id}] 已撤回中转群消息 ID: {relay_msg_id}")
