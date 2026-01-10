@@ -185,7 +185,12 @@ async def _process_component_and_get_gocq_part(
     elif comp_type_name == 'Forward':
         gocq_parts.append({"type": "text", "data": {"text": "[合并转发消息]"}})
     elif comp_type_name == 'Json':
-        json_data_str = getattr(comp, 'data', '{}')
+        json_data = getattr(comp, 'data', '{}')
+        if isinstance(json_data, dict):
+            json_data_str = json.dumps(json_data, ensure_ascii=False)
+        else:
+            json_data_str = str(json_data)
+            
         try:
             json.loads(json_data_str)
             gocq_part = {"type": "json", "data": {"data": json_data_str}}
@@ -198,7 +203,7 @@ async def _process_component_and_get_gocq_part(
     return gocq_parts
 
 @register(
-    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.1.3",
+    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.1.4",
     "https://github.com/Foolllll-J/astrbot_plugin_anti_revoke",
 )
 class AntiRevoke(Star):
