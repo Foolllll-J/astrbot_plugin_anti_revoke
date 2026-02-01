@@ -144,8 +144,9 @@ async def _process_component_and_get_gocq_part(
                     encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
                 gocq_parts.append({"type": "image", "data": {"file": f"base64://{encoded_string}"}})
             except Exception as e:
-                logger.error(f"[AntiRevoke] 图片转Base64失败: {e}")
-                gocq_parts.append({"type": "text", "data": {"text": "[图片处理失败]"}})
+                logger.error(f"[AntiRevoke] ❌ 图片转Base64失败: {e}")
+                # 降级重试：如果Base64失败，尝试使用文件路径
+                gocq_parts.append({"type": "image", "data": {"file": f"file:///{local_path}"}})
         else:
             gocq_parts.append({"type": "text", "data": {"text": "[图片转发失败]"}})
     elif comp_type_name == 'Video':
@@ -163,8 +164,15 @@ async def _process_component_and_get_gocq_part(
         cached_voice_path_str = getattr(comp, 'file', None)
         if cached_voice_path_str and Path(cached_voice_path_str).exists():
             absolute_path = str(Path(cached_voice_path_str).absolute())
-            logger.info(f"[AntiRevoke] 准备发送已缓存的语音，路径: {absolute_path}")
-            gocq_parts.append({"type": "record", "data": {"file": f"file:///{absolute_path}"}})
+            try:
+                with open(absolute_path, "rb") as voice_file:
+                    encoded_string = base64.b64encode(voice_file.read()).decode('utf-8')
+                logger.info(f"[AntiRevoke] 准备发送已缓存的语音 (Base64), 原路径: {absolute_path}")
+                gocq_parts.append({"type": "record", "data": {"file": f"base64://{encoded_string}"}})
+            except Exception as e:
+                logger.error(f"[AntiRevoke] ❌ 语音转Base64失败: {e}")
+                # 降级重试：如果Base64失败，尝试使用文件路径
+                gocq_parts.append({"type": "record", "data": {"file": f"file:///{absolute_path}"}})
         else:
             logger.error(f"[AntiRevoke] ❌ 准备发送语音时失败：缓存的语音文件已丢失，路径: {cached_voice_path_str}")
             gocq_parts.append({"type": "text", "data": {"text": f"[错误：撤回的语音文件已丢失]"}})
@@ -210,7 +218,7 @@ async def _process_component_and_get_gocq_part(
     return gocq_parts
 
 @register(
-    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.1.4",
+    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.1.5",
     "https://github.com/Foolllll-J/astrbot_plugin_anti_revoke",
 )
 class AntiRevoke(Star):
