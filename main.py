@@ -2,6 +2,7 @@ import asyncio
 import time
 import traceback
 import json
+import base64
 from pathlib import Path
 from typing import List, Dict
 import aiohttp
@@ -138,7 +139,13 @@ async def _process_component_and_get_gocq_part(
         local_path = await _download_and_cache_image(session, comp, temp_path)
         if local_path:
             local_files_to_cleanup.append(local_path)
-            gocq_parts.append({"type": "image", "data": {"file": local_path}})
+            try:
+                with open(local_path, "rb") as image_file:
+                    encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                gocq_parts.append({"type": "image", "data": {"file": f"base64://{encoded_string}"}})
+            except Exception as e:
+                logger.error(f"[AntiRevoke] 图片转Base64失败: {e}")
+                gocq_parts.append({"type": "text", "data": {"text": "[图片处理失败]"}})
         else:
             gocq_parts.append({"type": "text", "data": {"text": "[图片转发失败]"}})
     elif comp_type_name == 'Video':
