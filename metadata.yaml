@@ -3,4 +3,4 @@ display_name: QQ防撤回插件 # 用于展示的名字，可以是方便人类�
 desc: 可以监控指定群聊会话撤回的消息并发送给目标会话。 # 插件简短描述
 version: v1.1.4 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: Foolllll # 作者
-repo: https://github.com/Foolllll-J/astrbot_plugin_anti_revoke # 插件的仓库地址
+repo: https://github.com/Thetail001/astrbot_plugin_anti_revoke # 插件的仓库地址
