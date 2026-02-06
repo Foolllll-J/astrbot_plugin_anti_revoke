@@ -218,7 +218,7 @@ async def _process_component_and_get_gocq_part(
     return gocq_parts
 
 @register(
-    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.1.5",
+    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.1.6",
     "https://github.com/Foolllll-J/astrbot_plugin_anti_revoke",
 )
 class AntiRevoke(Star):
@@ -873,6 +873,18 @@ class AntiRevoke(Star):
                                         await client.send_group_msg(group_id=int(target_id_str), message=final_parts_to_send)
                                 except Exception as e: 
                                     logger.error(f"[{self.instance_id}] ❌ 发送特殊内容 ({comp_type_name}) 失败到 {target_type} {target_id_str}：{e}\n{traceback.format_exc()}")
+                                    try:
+                                        type_map = {
+                                            "Image": "图片", "Video": "视频", "Record": "语音", 
+                                            "File": "文件", "Forward": "合并转发", "Json": "小程序"
+                                        }
+                                        cn_type = type_map.get(comp_type_name, comp_type_name)
+                                        fail_tip = f"[发送失败: {cn_type} 消息可能包含无法上传的内容或过大]"
+                                        if target_type == "private":
+                                            await client.send_private_msg(user_id=int(target_id_str), message=[{"type": "text", "data": {"text": fail_tip}}])
+                                        else:
+                                            await client.send_group_msg(group_id=int(target_id_str), message=[{"type": "text", "data": {"text": fail_tip}}])
+                                    except: pass
                 
                 finally:
                     if local_files_to_cleanup: asyncio.create_task(_cleanup_local_files(local_files_to_cleanup))
