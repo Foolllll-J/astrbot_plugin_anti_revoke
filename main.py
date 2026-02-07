@@ -218,7 +218,7 @@ async def _process_component_and_get_gocq_part(
     return gocq_parts
 
 @register(
-    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.1.6",
+    "astrbot_plugin_anti_revoke", "Foolllll", "QQ 防撤回", "1.1.6",
     "https://github.com/Foolllll-J/astrbot_plugin_anti_revoke",
 )
 class AntiRevoke(Star):

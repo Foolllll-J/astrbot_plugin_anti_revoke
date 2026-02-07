@@ -1,8 +1,8 @@
 <div align="center">
 
-# 🛡️ QQ 防撤回插件
+# 📼 QQ 防撤回插件
 
-<i>👀 BIG BROTHER IS WATCHING YOU!</i>
+<i>🍃 声落有声，影过留影</i>
 
 ![License](https://img.shields.io/badge/license-AGPL--3.0-green?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white)
