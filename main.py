@@ -218,7 +218,7 @@ async def _process_component_and_get_gocq_part(
     return gocq_parts
 
 @register(
-    "astrbot_plugin_anti_revoke", "Foolllll", "QQ 防撤回", "1.1.6",
+    "astrbot_plugin_anti_revoke", "Foolllll", "QQ 防撤回", "1.2.0",
     "https://github.com/Foolllll-J/astrbot_plugin_anti_revoke",
 )
 class AntiRevoke(Star):
@@ -244,7 +244,42 @@ class AntiRevoke(Star):
         self.file_cache_path = self.temp_path / "files"
         self.file_cache_path.mkdir(exist_ok=True)
         self._cleanup_cache_on_startup()
+        asyncio.create_task(self._cleanup_kv_data())
     
+    async def _cleanup_kv_data(self):
+        """清理 KV 存储中不再监控的群组配置"""
+        kv_targets = await self.get_kv_data("forward_targets", {})
+        if not kv_targets:
+            return
+        
+        cleaned_targets = {}
+        changed = False
+        for group_id, targets in kv_targets.items():
+            if group_id in self.monitor_groups:
+                cleaned_targets[group_id] = targets
+            else:
+                changed = True
+                logger.info(f"[{self.instance_id}] 清理已不再监控的群组转发配置: {group_id}")
+        
+        if changed:
+            await self.put_kv_data("forward_targets", cleaned_targets)
+
+    async def _get_targets_for_group(self, group_id: str) -> List[tuple]:
+        """获取群组的转发目标配置，优先使用 KV 存储"""
+        kv_targets = await self.get_kv_data("forward_targets", {})
+        group_targets = kv_targets.get(group_id, [])
+        
+        if group_targets:
+            targets = []
+            for t in group_targets:
+                if t.startswith("@"):
+                    targets.append(("private", t[1:]))
+                elif t.startswith("#"):
+                    targets.append(("group", t[1:]))
+            return targets
+        else:
+            return [("private", tid) for tid in self.target_receivers] + [("group", tid) for tid in self.target_groups]
+
     async def _download_video_from_url(self, url: str, save_path: Path) -> bool:
         try:
             async with aiohttp.ClientSession() as session:
@@ -287,6 +322,71 @@ class AntiRevoke(Star):
     async def terminate(self):
         logger.info(f"[{self.instance_id}] 插件已卸载/重载。")
         
+    @filter.command("撤回转发")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def add_forward(self, event: AstrMessageEvent, group_id: str, target: str):
+        """设置撤回消息的转发目标。格式：撤回转发 群号 @私聊或#群聊"""
+        if group_id not in self.monitor_groups:
+            yield event.plain_result(f"❌ 群号 {group_id} 不在监控列表中，请先在配置中添加。")
+            return
+        
+        if not (target.startswith("@") or target.startswith("#")):
+            yield event.plain_result("❌ 目标会话格式错误。使用 @数字 表示私聊，#数字 表示群聊。")
+            return
+        
+        if not target[1:].isdigit():
+            yield event.plain_result("❌ 目标会话 ID 必须为数字。")
+            return
+
+        kv_targets = await self.get_kv_data("forward_targets", {})
+        if group_id not in kv_targets:
+            kv_targets[group_id] = []
+        
+        if target not in kv_targets[group_id]:
+            kv_targets[group_id].append(target)
+            await self.put_kv_data("forward_targets", kv_targets)
+            yield event.plain_result(f"✅ 已添加转发目标: 群 {group_id} -> {target}")
+        else:
+            yield event.plain_result(f"ℹ️ 该转发目标已存在: 群 {group_id} -> {target}")
+
+    @filter.command("取消撤回转发")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def remove_forward(self, event: AstrMessageEvent, group_id: str, target: str = None):
+        """取消撤回消息的转发目标。格式：取消撤回转发 群号 [目标]"""
+        kv_targets = await self.get_kv_data("forward_targets", {})
+        if group_id not in kv_targets:
+            yield event.plain_result(f"❌ 未找到群 {group_id} 的特定转发配置。")
+            return
+        
+        if target:
+            if target in kv_targets[group_id]:
+                kv_targets[group_id].remove(target)
+                if not kv_targets[group_id]:
+                    del kv_targets[group_id]
+                await self.put_kv_data("forward_targets", kv_targets)
+                yield event.plain_result(f"✅ 已取消转发目标: 群 {group_id} -> {target}")
+            else:
+                yield event.plain_result(f"❌ 群 {group_id} 的配置中不包含目标 {target}。")
+        else:
+            del kv_targets[group_id]
+            await self.put_kv_data("forward_targets", kv_targets)
+            yield event.plain_result(f"✅ 已重置群 {group_id} 的所有特定转发目标。")
+
+    @filter.command("查看撤回转发")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def list_forward(self, event: AstrMessageEvent):
+        """查看所有自定义的撤回转发配置"""
+        kv_targets = await self.get_kv_data("forward_targets", {})
+        if not kv_targets:
+            yield event.plain_result("ℹ️ 当前没有自定义的撤回转发配置。")
+            return
+        
+        msg = "📋 自定义撤回转发配置：\n"
+        for gid, targets in kv_targets.items():
+            msg += f"群 {gid} -> {', '.join(targets)}\n"
+        
+        yield event.plain_result(msg.strip())
+
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=20)
     async def handle_message_cache(self, event: AstrMessageEvent):
@@ -717,7 +817,7 @@ class AntiRevoke(Star):
                     logger.info(f"[{self.instance_id}] 合并转发撤回 - 群: {group_name}, 发送者: {member_nickname}, 操作者: {operator_nickname} ({operator_id})")
                     
                     # 准备所有通知目标
-                    targets = [("private", tid) for tid in self.target_receivers] + [("group", tid) for tid in self.target_groups]
+                    targets = await self._get_targets_for_group(group_id)
                     
                     # 向每个目标转发
                     for target_type, target_id in targets:
@@ -795,7 +895,7 @@ class AntiRevoke(Star):
                     other_components = [comp for comp in components if getattr(comp.type, 'name', 'unknown') not in ['Video', 'Record', 'Json', 'File', 'Forward']]
                     
                     async with aiohttp.ClientSession() as session:
-                        targets = [("private", tid) for tid in self.target_receivers] + [("group", tid) for tid in self.target_groups]
+                        targets = await self._get_targets_for_group(group_id)
                         for target_type, target_id in targets:
                             target_id_str = str(target_id)
                             
