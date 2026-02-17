@@ -218,7 +218,7 @@ async def _process_component_and_get_gocq_part(
     return gocq_parts
 
 @register(
-    "astrbot_plugin_anti_revoke", "Foolllll", "QQ 防撤回", "1.2.0",
+    "astrbot_plugin_anti_revoke", "Foolllll", "QQ 防撤回", "1.2.1",
     "https://github.com/Foolllll-J/astrbot_plugin_anti_revoke",
 )
 class AntiRevoke(Star):
@@ -572,6 +572,7 @@ class AntiRevoke(Star):
             raw_file_names = []
             raw_file_sizes = {}
             raw_video_sizes = {}
+            raw_record_urls = {}
             try:
                 if not isinstance(raw_message, dict):
                     raw_message = {}
@@ -598,6 +599,11 @@ class AntiRevoke(Star):
                                     raw_video_sizes[file_id] = int(file_size) if isinstance(file_size, str) else file_size
                                 except ValueError:
                                     logger.warning(f"[AntiRevoke] 无法解析视频大小: {file_size}")
+                        elif segment.get("type") == "record":
+                            file_id = segment.get("data", {}).get("file")
+                            url = segment.get("data", {}).get("url")
+                            if file_id:
+                                if url: raw_record_urls[file_id] = url
             except Exception as e:
                 logger.warning(f"[AntiRevoke] 解析 raw_message 失败: {e}")
             
@@ -659,9 +665,38 @@ class AntiRevoke(Star):
                         if not file_id: continue
                         
                         try:
+                            # 1. 尝试从组件属性或原始消息中获取 url 并下载
+                            record_url = getattr(comp, 'url', None) or raw_record_urls.get(file_id)
+                            if record_url:
+                                try:
+                                    original_suffix = '.amr'
+                                    # 尝试从 url 或文件名推断后缀
+                                    if getattr(comp, 'file', '').endswith('.slk'):
+                                        original_suffix = '.slk'
+                                    
+                                    permanent_path = self.voice_cache_path / f"{timestamp_ms}{original_suffix}"
+                                    
+                                    headers = {'User-Agent': 'Mozilla/5.0 ...'}
+                                    async with aiohttp.ClientSession() as session:
+                                        async with session.get(record_url, headers=headers, timeout=15) as response:
+                                            response.raise_for_status()
+                                            voice_bytes = await response.read()
+                                            with open(permanent_path, 'wb') as f:
+                                                f.write(voice_bytes)
+                                    
+                                    os.chmod(permanent_path, 0o644)
+
+                                    setattr(comp, 'file', str(permanent_path.absolute()))
+                                    asyncio.create_task(delayed_delete(self.cache_expiration_time, permanent_path))
+                                    logger.debug(f"[{self.instance_id}] 语音消息通过 URL 下载已成功缓存到: {permanent_path}")
+                                    continue
+                                except Exception as e:
+                                    logger.warning(f"[{self.instance_id}] [Record处理] 尝试通过 URL 下载失败: {e}，将尝试使用本地路径兜底。")
+                            
+                            # 2. 如果 URL 失败或不存在，尝试通过 API 获取本地路径并拷贝
                             ret = await client.api.call_action('get_file', **{"file_id": file_id})
                             local_path = ret.get('file')
-
+                            
                             if not local_path or not os.path.exists(local_path):
                                 logger.error(f"[{self.instance_id}] [Record处理] ❌ API未能提供有效的本地文件路径。返回: {ret}")
                                 setattr(comp, 'file', "Error: API did not return a valid file path.")

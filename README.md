@@ -12,7 +12,7 @@
 
 ## ✨ 简介
 
-一款为 [**AstrBot**](https://github.com/AstrBotDevs/AstrBot) 设计的高可靠性 QQ 防撤回插件，支持对多种消息类型的监控与恢复，包括文字、图片、语音、视频、文件、聊天记录以及小程序等。
+一款为 [**AstrBot**](https://github.com/AstrBotDevs/AstrBot) 设计的 QQ 防撤回插件，支持对多种消息类型的监控与恢复，包括文字、图片、语音、视频、文件、聊天记录以及小程序等。
 
 ---
 
@@ -64,6 +64,10 @@
 
 <details>
 <summary>点击展开更新日志</summary>
+
+**v1.2.1**
+
+- 优化语音消息缓存逻辑
 
 **v1.2.0**
 
