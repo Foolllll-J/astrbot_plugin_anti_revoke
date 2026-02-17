@@ -218,7 +218,7 @@ async def _process_component_and_get_gocq_part(
     return gocq_parts
 
 @register(
-    "astrbot_plugin_anti_revoke", "Foolllll", "QQ 防撤回", "1.2.1",
+    "astrbot_plugin_anti_revoke", "Foolllll", "QQ 防撤回", "1.2.2",
     "https://github.com/Foolllll-J/astrbot_plugin_anti_revoke",
 )
 class AntiRevoke(Star):
@@ -800,6 +800,19 @@ class AntiRevoke(Star):
             if group_id not in self.monitor_groups or not message_id: return None
             
             file_path = next(self.temp_path.glob(f"*_{group_id}_{message_id}.json"), None)
+
+            # 最大等待时间为缓存过期时间，优化大文件消息以及秒撤回的使用场景
+            if not file_path or not file_path.exists():
+                logger.debug(f"[{self.instance_id}] 尚未找到消息缓存 (ID: {message_id})，开始轮询等待...")
+                max_retries = self.cache_expiration_time  # 1s 一次
+                for i in range(max_retries): 
+                    await asyncio.sleep(1) 
+                    file_path = next(self.temp_path.glob(f"*_{group_id}_{message_id}.json"), None)
+                    if file_path and file_path.exists():
+                        logger.debug(f"[{self.instance_id}] 在轮询第 {i+1} 次后找到了缓存文件。")
+                        break
+                else:
+                    logger.warning(f"[{self.instance_id}] 等待 {self.cache_expiration_time} 秒后仍未找到消息记录 (ID: {message_id})，停止等待。")
 
             cached_data = None
 
