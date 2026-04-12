@@ -3,8 +3,9 @@ import time
 import traceback
 import json
 import base64
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Any
 import aiohttp
 import os
 import shutil
@@ -12,11 +13,24 @@ import shutil
 from astrbot.api import logger
 from astrbot.api.star import StarTools
 from astrbot.api import message_components as Comp
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.platform import MessageType
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
+
+
+def build_cache_task_key(group_id: str, message_id: str) -> str:
+    return f"{group_id}:{message_id}"
+
+
+@dataclass
+class CacheTaskState:
+    task: asyncio.Task | None
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    started_at: float = field(default_factory=time.time)
 
 
 def get_private_unified_msg_origin(user_id: str, platform: str = "aiocqhttp") -> str:
@@ -210,19 +224,20 @@ async def _process_component_and_get_gocq_part(
             
     return gocq_parts
 
-@register(
-    "astrbot_plugin_anti_revoke", "Foolllll", "QQ 防撤回", "1.2.2",
-    "https://github.com/Foolllll-J/astrbot_plugin_anti_revoke",
-)
+
 class AntiRevoke(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
+        config = config or {}
         self.monitor_groups = [str(g) for g in config.get("monitor_groups", []) or []]
         self.target_receivers = [str(r) for r in config.get("target_receivers", []) or []]
         self.target_groups = [str(g) for g in config.get("target_groups", []) or []]
         self.ignore_senders = [str(s) for s in config.get("ignore_senders", []) or []]
         self.instance_id = "AntiRevoke"
         self.cache_expiration_time = int(config.get("cache_expiration_time", 300))
+        self.cache_pending_timeout = min(self.cache_expiration_time, 2)
+        self.file_download_retry_attempts = 3
+        self.file_download_retry_delay = 0.2
         self.file_size_threshold_mb = int(config.get("file_size_threshold_mb", 300))
         self.forward_relay_group = str(config.get("forward_relay_group", "") or "")
         self.forward_to_self = config.get("forward_to_self", False)
@@ -236,6 +251,7 @@ class AntiRevoke(Star):
         self.voice_cache_path.mkdir(exist_ok=True)
         self.file_cache_path = self.temp_path / "files"
         self.file_cache_path.mkdir(exist_ok=True)
+        self._cache_tasks: dict[str, CacheTaskState] = {}
         self._cleanup_cache_on_startup()
         asyncio.create_task(self._cleanup_kv_data())
     
@@ -311,6 +327,199 @@ class AntiRevoke(Star):
         except Exception as e:
             logger.error(f"[{self.instance_id}] 自动撤回中转群消息失败 (ID: {relay_msg_id}): {e}")
 
+    def _should_skip_cache(self, group_id: str, sender_id: str, message_type) -> bool:
+        return (
+            message_type != MessageType.GROUP_MESSAGE
+            or group_id not in self.monitor_groups
+            or str(sender_id) in self.ignore_senders
+        )
+
+    def _get_cache_file_path(self, group_id: str, message_id: str) -> Path:
+        return self.temp_path / f"cache_{group_id}_{message_id}.json"
+
+    def _find_cache_file(self, group_id: str, message_id: str) -> Path | None:
+        file_path = self._get_cache_file_path(group_id, message_id)
+        if file_path.exists():
+            return file_path
+        return next(self.temp_path.glob(f"*_{group_id}_{message_id}.json"), None)
+
+    def _write_cache_record(self, file_path: Path, data: dict[str, Any]) -> None:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    async def _get_file_with_retry(self, comp) -> str:
+        last_error = None
+        for attempt in range(1, self.file_download_retry_attempts + 1):
+            try:
+                return await comp.get_file()
+            except (aiohttp.ClientPayloadError, aiohttp.ClientConnectionError) as e:
+                last_error = e
+                logger.warning(
+                    f"[{self.instance_id}] [File处理] 下载文件失败，第 {attempt}/{self.file_download_retry_attempts} 次重试: {e}"
+                )
+                if attempt >= self.file_download_retry_attempts:
+                    break
+                await asyncio.sleep(self.file_download_retry_delay)
+        if last_error:
+            raise last_error
+        return ""
+
+    async def _wait_for_cache_task_result(self, cache_key: str, timeout: float | None = None) -> dict[str, Any] | None:
+        state = self._cache_tasks.get(cache_key)
+        if not state:
+            return None
+        if not state.done.is_set():
+            try:
+                await asyncio.wait_for(state.done.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.debug(f"[{self.instance_id}] 缓存任务仍在进行中: {cache_key}")
+                return None
+        return state.result
+
+    async def _expire_cache_task_state(self, cache_key: str, state: CacheTaskState):
+        await asyncio.sleep(self.cache_expiration_time)
+        current_state = self._cache_tasks.get(cache_key)
+        if current_state is state:
+            self._cache_tasks.pop(cache_key, None)
+
+    async def _run_cache_task(self, cache_key: str, state: CacheTaskState, payload: dict[str, Any]):
+        file_path = payload.get("file_path")
+        try:
+            state.result = await self._cache_message_worker(payload)
+        except Exception as e:
+            state.error = str(e)
+            if file_path:
+                self._write_cache_record(
+                    file_path,
+                    {
+                        "status": "failed",
+                        "group_id": payload.get("group_id"),
+                        "message_id": payload.get("message_id"),
+                        "sender_id": payload.get("sender_id"),
+                        "timestamp": payload.get("timestamp"),
+                        "error": str(e),
+                    },
+                )
+                asyncio.create_task(delayed_delete(self.cache_expiration_time, file_path))
+            logger.error(f"[{self.instance_id}] 缓存任务失败 ({cache_key}): {e}\n{traceback.format_exc()}")
+        finally:
+            state.task = None
+            state.done.set()
+            asyncio.create_task(self._expire_cache_task_state(cache_key, state))
+
+    def _schedule_cache_task(self, cache_key: str, payload: dict[str, Any]) -> CacheTaskState:
+        existing_state = self._cache_tasks.get(cache_key)
+        if existing_state and not existing_state.done.is_set():
+            return existing_state
+
+        state = CacheTaskState(task=None)
+        self._cache_tasks[cache_key] = state
+        state.task = asyncio.create_task(self._run_cache_task(cache_key, state, payload))
+        return state
+
+    def _load_cached_data(self, file_path: Path | None) -> dict[str, Any] | None:
+        if not file_path or not file_path.exists():
+            return None
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"[{self.instance_id}] 读取或解析本地缓存失败: {e}")
+            return None
+
+    async def _get_group_context_names(
+        self,
+        client,
+        group_id: str,
+        sender_id: str | None = None,
+        operator_id: str | None = None,
+    ) -> tuple[str, str, str]:
+        """统一获取群名、发送者昵称、操作者昵称，失败时自动降级到原始ID。"""
+        group_name = str(group_id)
+        sender_name = str(sender_id) if sender_id else "未知发送者"
+        operator_name = str(operator_id) if operator_id else ""
+
+        group_id_int: int | None
+        try:
+            group_id_int = int(group_id)
+        except Exception:
+            group_id_int = None
+
+        if group_id_int is not None:
+            try:
+                group_info = await client.api.call_action('get_group_info', group_id=group_id_int)
+                if isinstance(group_info, dict):
+                    group_name = group_info.get('group_name', group_name)
+            except Exception:
+                pass
+
+        async def _get_member_name(user_id: str | None, default_name: str) -> str:
+            if not user_id or group_id_int is None:
+                return default_name
+            try:
+                user_id_int = int(user_id)
+            except Exception:
+                return default_name
+            try:
+                member_info = await client.api.call_action(
+                    'get_group_member_info',
+                    group_id=group_id_int,
+                    user_id=user_id_int,
+                )
+                if isinstance(member_info, dict):
+                    card, nickname = member_info.get('card', ''), member_info.get('nickname', '')
+                    return card or nickname or default_name
+            except Exception:
+                pass
+            return default_name
+
+        sender_name = await _get_member_name(sender_id, sender_name)
+        operator_name = await _get_member_name(operator_id, operator_name)
+        return group_name, sender_name, operator_name
+
+    async def _poll_cache_record(
+        self,
+        group_id: str,
+        message_id: str,
+    ) -> dict[str, Any] | None:
+        short_poll_interval = 0.1
+        long_poll_interval = 1.0
+        file_path = self._get_cache_file_path(group_id, message_id)
+        cached_data = None
+        started_at = time.monotonic()
+        pending_deadline = time.monotonic() + self.cache_pending_timeout
+        logger.debug(f"[{self.instance_id}] 开始轮询缓存（群: {group_id}, 消息ID: {message_id}）")
+
+        while time.monotonic() < pending_deadline:
+            cached_data = self._load_cached_data(file_path)
+            if cached_data and str(cached_data.get("message_id", "")) == message_id:
+                break
+            await asyncio.sleep(short_poll_interval)
+        else:
+            return None
+
+        if not cached_data:
+            elapsed = time.monotonic() - started_at
+            logger.warning(f"[{self.instance_id}] 缓存文件读取为空（ID: {message_id}, 耗时: {elapsed:.2f}s）")
+            return None
+
+        wait_deadline = started_at + self.cache_expiration_time
+        while time.monotonic() < wait_deadline:
+            cached_data = self._load_cached_data(file_path)
+            if not cached_data:
+                await asyncio.sleep(long_poll_interval)
+                continue
+            status = cached_data.get("status")
+            if status in ("done", "failed"):
+                elapsed = time.monotonic() - started_at
+                logger.debug(f"[{self.instance_id}] 轮询结束（ID: {message_id}, 状态: {status}, 耗时: {elapsed:.2f}s）")
+                return cached_data
+            await asyncio.sleep(long_poll_interval)
+
+        elapsed = time.monotonic() - started_at
+        logger.warning(f"[{self.instance_id}] 长轮询超时（ID: {message_id}, 上限: {self.cache_expiration_time}s, 耗时: {elapsed:.2f}s）")
+        return None
+
     async def terminate(self):
         logger.info(f"[{self.instance_id}] 插件已卸载/重载。")
         
@@ -382,389 +591,372 @@ class AntiRevoke(Star):
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=20)
     async def handle_message_cache(self, event: AstrMessageEvent):
-        """处理消息缓存，包括合并转发消息的中转"""
+        """处理消息缓存，后台执行缓存任务"""
         group_id = str(event.get_group_id())
         message_id = str(event.message_obj.message_id)
-        if event.get_message_type() != MessageType.GROUP_MESSAGE or group_id not in self.monitor_groups:
+        sender_id = str(event.get_sender_id())
+        if self._should_skip_cache(group_id, sender_id, event.get_message_type()):
             return None
-        
+
+        message_obj = event.get_messages()
+        components = message_obj.components if isinstance(message_obj, MessageChain) else message_obj if isinstance(message_obj, list) else []
+        components = [comp for comp in components if getattr(comp.type, 'name', 'unknown') != 'Reply']
+        if not components:
+            return None
+        component_types = [getattr(comp.type, "name", "unknown") for comp in components]
+
+        cache_key = build_cache_task_key(group_id, message_id)
+        cache_file = self._get_cache_file_path(group_id, message_id)
+        if cache_file and cache_file.exists():
+            return None
+
+        existing_state = self._cache_tasks.get(cache_key)
+        if existing_state and not existing_state.done.is_set():
+            return None
+
+        self._write_cache_record(
+            cache_file,
+            {
+                "status": "pending",
+                "group_id": group_id,
+                "message_id": message_id,
+                "sender_id": sender_id,
+                "timestamp": event.message_obj.timestamp,
+                "component_types": component_types,
+            },
+        )
+
+        payload = {
+            'group_id': group_id,
+            'message_id': message_id,
+            'sender_id': sender_id,
+            'timestamp': event.message_obj.timestamp,
+            'raw_message': event.message_obj.raw_message,
+            'components': components,
+            'client': event.bot,
+            'file_path': cache_file,
+        }
+        self._schedule_cache_task(cache_key, payload)
+        return None
+
+    async def _cache_message_worker(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        group_id = payload['group_id']
+        message_id = payload['message_id']
+        sender_id = payload['sender_id']
+        timestamp = payload['timestamp']
+        cache_file = payload.get('file_path')
+        raw_message = payload.get('raw_message')
+        if not isinstance(raw_message, dict):
+            raw_message = {}
+        components = payload.get('components', [])
+        client = payload['client']
+
         relay_info = None
-        try:
-            raw_message = event.message_obj.raw_message
-            if not isinstance(raw_message, dict):
-                raw_message = {}
-            message_list = raw_message.get("message", [])
-            
-            is_forward = False
-            if isinstance(message_list, list) and len(message_list) > 0:
-                first_segment = message_list[0]
-                if isinstance(first_segment, dict) and first_segment.get("type") == "forward":
-                    is_forward = True
-            
-            if is_forward and self.forward_to_self:
-                try:
-                    client = event.bot
-                    login_info = await client.api.call_action("get_login_info")
-                    self_id = login_info.get("user_id")
-                    if self_id:
-                        logger.info(f"[{self.instance_id}] 检测到合并转发消息，准备转发给机器人自身 ({self_id})，原消息ID: {message_id}")
-                        await client.api.call_action(
-                            "forward_friend_single_msg",
-                            user_id=int(self_id),
-                            message_id=message_id
-                        )
-                        
-                        relay_msg_id = None
-                        await asyncio.sleep(1)
-                        try:
-                            history_result = await client.api.call_action(
-                                "get_friend_msg_history",
-                                user_id=int(self_id),
-                                count=10
-                            )
-                            messages = []
-                            if isinstance(history_result, dict):
-                                messages = history_result.get("messages", []) or history_result.get("data", {}).get("messages", [])
-                            
-                            target_timestamp = event.message_obj.timestamp
-                            for msg in reversed(messages):
-                                msg_time = int(msg.get("time", 0))
-                                if abs(msg_time - target_timestamp) <= 2:
-                                    relay_msg_id = msg.get("message_id")
-                                    break
-                        except Exception as e:
-                            logger.warning(f"[{self.instance_id}] 查询自身私聊历史消息失败: {e}")
-                                
-                        if relay_msg_id:
-                            relay_info = {
-                                "relay_msg_id": relay_msg_id,
-                                "sender_id": event.get_sender_id(),
-                                "timestamp": event.message_obj.timestamp,
-                                "group_id": group_id,
-                                "is_private_relay": True # 标记为私聊中转
-                            }
-                            logger.info(f"[{self.instance_id}] 转发给自身成功，已记录映射关系 (ID: {relay_msg_id})")
-                except Exception as e:
-                    logger.error(f"[{self.instance_id}] ❌ 转发合并消息给机器人自身失败: {e}")
+        message_list = raw_message.get('message', [])
+        is_forward = False
+        if isinstance(message_list, list) and message_list:
+            first_segment = message_list[0]
+            if isinstance(first_segment, dict) and first_segment.get('type') == 'forward':
+                is_forward = True
 
-            if not relay_info and is_forward and self.forward_relay_group:
-                logger.info(f"[{self.instance_id}] 检测到合并转发消息，准备转发到中转群 {self.forward_relay_group}，原消息ID: {message_id}")
-                try:
-                    client = event.bot
+        if is_forward and self.forward_to_self:
+            try:
+                login_info = await client.api.call_action('get_login_info')
+                self_id = login_info.get('user_id')
+                if self_id:
                     await client.api.call_action(
-                        "forward_group_single_msg",
-                        group_id=int(self.forward_relay_group),
-                        message_id=message_id
+                        'forward_friend_single_msg',
+                        user_id=int(self_id),
+                        message_id=message_id,
                     )
-                    
-                    relay_msg_id = None
-                    logger.info(f"[{self.instance_id}] 转发到中转群完成，准备通过查询群历史消息获取 ID...")
-                    await asyncio.sleep(1)
-                    
-                    try:
-                        # 尝试获取自身ID以过滤消息
-                        self_id = None
-                        try:
-                            login_info = await client.api.call_action("get_login_info")
-                            self_id = str(login_info.get("user_id"))
-                        except Exception:
-                            pass
 
-                        target_timestamp = event.message_obj.timestamp
-                        found_msg = None
-                        next_seq = 0
-                        
-                        # 循环获取历史消息，直到找到或超出时间范围
-                        for _ in range(5): # 最多尝试5次分页
-                            history_result = await client.api.call_action(
-                                "get_group_msg_history",
-                                group_id=int(self.forward_relay_group),
-                                message_seq=next_seq,
-                                count=20
-                            )
-                            
-                            messages = []
-                            if isinstance(history_result, dict):
-                                messages = history_result.get("data", {}).get("messages", [])
-                                if not messages:
-                                    messages = history_result.get("messages", [])
-                            
+                    relay_msg_id = None
+                    await asyncio.sleep(1)
+                    try:
+                        history_result = await client.api.call_action(
+                            'get_friend_msg_history',
+                            user_id=int(self_id),
+                            count=10,
+                        )
+                        messages = []
+                        if isinstance(history_result, dict):
+                            messages = history_result.get('messages', []) or history_result.get('data', {}).get('messages', [])
+                        for msg in reversed(messages):
+                            msg_time = int(msg.get('time', 0))
+                            if abs(msg_time - timestamp) <= 2:
+                                relay_msg_id = msg.get('message_id')
+                                break
+                    except Exception as exc:
+                        logger.warning(f'[{self.instance_id}] 查询自身私聊历史消息失败: {exc}')
+
+                    if relay_msg_id:
+                        relay_info = {
+                            'relay_msg_id': relay_msg_id,
+                            'sender_id': sender_id,
+                            'timestamp': timestamp,
+                            'group_id': group_id,
+                            'is_private_relay': True,
+                        }
+            except Exception as exc:
+                logger.error(f'[{self.instance_id}] ❌ 转发合并消息给机器人自身失败: {exc}')
+
+        if not relay_info and is_forward and self.forward_relay_group:
+            try:
+                await client.api.call_action(
+                    'forward_group_single_msg',
+                    group_id=int(self.forward_relay_group),
+                    message_id=message_id,
+                )
+
+                relay_msg_id = None
+                relay_msg_time = None
+                await asyncio.sleep(1)
+                try:
+                    self_id = None
+                    try:
+                        login_info = await client.api.call_action('get_login_info')
+                        self_id = str(login_info.get('user_id'))
+                    except Exception:
+                        pass
+
+                    found_msg = None
+                    next_seq = 0
+                    for _ in range(5):
+                        history_result = await client.api.call_action(
+                            'get_group_msg_history',
+                            group_id=int(self.forward_relay_group),
+                            message_seq=next_seq,
+                            count=20,
+                        )
+                        messages = []
+                        if isinstance(history_result, dict):
+                            messages = history_result.get('data', {}).get('messages', [])
                             if not messages:
-                                await asyncio.sleep(1)
+                                messages = history_result.get('messages', [])
+                        if not messages:
+                            await asyncio.sleep(1)
+                            continue
+
+                        for msg in reversed(messages):
+                            msg_sender_id = str(msg.get('sender', {}).get('user_id', '')) or str(msg.get('user_id', ''))
+                            if self_id and msg_sender_id != self_id:
                                 continue
-                                
-                            # 倒序遍历（从新到旧）
-                            for msg in reversed(messages):
-                                msg_sender_id = str(msg.get("sender", {}).get("user_id", ""))
-                                if not msg_sender_id:
-                                    msg_sender_id = str(msg.get("user_id", ""))
-                                    
-                                if self_id and msg_sender_id != self_id:
-                                    continue
-                                    
-                                msg_time = int(msg.get("time", 0))
-                                if abs(msg_time - target_timestamp) <= 1:
-                                    found_msg = msg
-                                    break
-                            
-                            if found_msg:
-                                break
-                                
-                            # 准备下一次分页
-                            oldest_msg = messages[0]
-                            next_seq = oldest_msg.get("message_seq")
-                            oldest_time = int(oldest_msg.get("time", 0))
-                            
-                            # 如果获取到的最旧消息时间已经超过缓存过期时间（相对于目标时间），则停止搜索
-                            if target_timestamp - oldest_time > self.cache_expiration_time:
-                                logger.warning(f"[{self.instance_id}] 搜索范围已超过缓存过期时间，停止搜索。")
-                                break
-                                
-                            if next_seq == 0: # 防止死循环
+                            msg_time = int(msg.get('time', 0))
+                            if abs(msg_time - timestamp) <= 1:
+                                found_msg = msg
                                 break
 
                         if found_msg:
-                            relay_msg_id = found_msg.get("message_id")
-                            relay_msg_time = found_msg.get("time")
-                        else:
-                            logger.warning(f"[{self.instance_id}] 未在历史消息中找到匹配的机器人发送记录")
-                                
-                    except Exception as e:
-                        logger.error(f"[{self.instance_id}] 查询历史消息失败: {e}")
-                    
-                    if relay_msg_id:
-                        # 保存映射关系: 原消息ID -> 中转群消息ID
-                        relay_info = {
-                            "relay_msg_id": relay_msg_id,
-                            "sender_id": event.get_sender_id(),
-                            "timestamp": event.message_obj.timestamp,
-                            "relay_timestamp": relay_msg_time, # 记录中转消息的实际时间戳
-                            "group_id": group_id
-                        }
-                        logger.info(f"[{self.instance_id}] 合并转发成功，已记录映射关系")
-                        
-                        # 设置自动撤回任务
-                        if self.auto_recall_relay:
-                            asyncio.create_task(self._auto_recall_relay_msg(client, relay_msg_id))
-                    else:
-                        logger.warning(f"[{self.instance_id}] 无法获取中转消息ID，该消息的撤回检测将不可用")
-                    
-                except Exception as e:
-                    logger.error(f"[{self.instance_id}] ❌ 转发合并消息到中转群失败: {e}\n{traceback.format_exc()}")
-            
-            message_obj = event.get_messages()
-            timestamp_ms = int(time.time() * 1000)
-            components = message_obj.components if isinstance(message_obj, MessageChain) else message_obj if isinstance(message_obj, list) else []
-            components = [comp for comp in components if getattr(comp.type, 'name', 'unknown') != 'Reply']
-            if not components: return None
+                            break
 
-            raw_file_names = []
-            raw_file_sizes = {}
-            raw_video_sizes = {}
-            raw_record_urls = {}
-            try:
-                if not isinstance(raw_message, dict):
-                    raw_message = {}
-                message_list = raw_message.get("message", [])
-                if isinstance(message_list, list):
-                    for segment in message_list:
-                        if not isinstance(segment, dict):
+                        oldest_msg = messages[0]
+                        next_seq = oldest_msg.get('message_seq')
+                        oldest_time = int(oldest_msg.get('time', 0))
+                        if timestamp - oldest_time > self.cache_expiration_time:
+                            break
+                        if next_seq == 0:
+                            break
+
+                    if found_msg:
+                        relay_msg_id = found_msg.get('message_id')
+                        relay_msg_time = found_msg.get('time')
+                except Exception as exc:
+                    logger.error(f'[{self.instance_id}] 查询历史消息失败: {exc}')
+
+                if relay_msg_id:
+                    relay_info = {
+                        'relay_msg_id': relay_msg_id,
+                        'sender_id': sender_id,
+                        'timestamp': timestamp,
+                        'relay_timestamp': relay_msg_time,
+                        'group_id': group_id,
+                    }
+                    if self.auto_recall_relay:
+                        asyncio.create_task(self._auto_recall_relay_msg(client, relay_msg_id))
+            except Exception as exc:
+                logger.error(f'[{self.instance_id}] ❌ 转发合并消息到中转群失败: {exc}\n{traceback.format_exc()}')
+
+        timestamp_ms = int(time.time() * 1000)
+        raw_file_names = []
+        raw_file_sizes = {}
+        raw_video_sizes = {}
+        raw_record_urls = {}
+        try:
+            if isinstance(message_list, list):
+                for segment in message_list:
+                    if not isinstance(segment, dict):
+                        continue
+                    if segment.get('type') == 'file':
+                        file_name = segment.get('data', {}).get('file')
+                        file_size = segment.get('data', {}).get('file_size')
+                        if file_name:
+                            raw_file_names.append(file_name)
+                        if file_size:
+                            try:
+                                raw_file_sizes[file_name] = int(file_size) if isinstance(file_size, str) else file_size
+                            except ValueError:
+                                logger.warning(f'[AntiRevoke] 无法解析文件大小: {file_size}')
+                    elif segment.get('type') == 'video':
+                        file_id = segment.get('data', {}).get('file')
+                        file_size = segment.get('data', {}).get('file_size')
+                        if file_id and file_size:
+                            try:
+                                raw_video_sizes[file_id] = int(file_size) if isinstance(file_size, str) else file_size
+                            except ValueError:
+                                logger.warning(f'[AntiRevoke] 无法解析视频大小: {file_size}')
+                    elif segment.get('type') == 'record':
+                        file_id = segment.get('data', {}).get('file')
+                        url = segment.get('data', {}).get('url')
+                        if file_id and url:
+                            raw_record_urls[file_id] = url
+        except Exception as exc:
+            logger.warning(f'[AntiRevoke] 解析 raw_message 失败: {exc}')
+
+        local_file_map = {}
+        has_downloadable_content = any(getattr(comp.type, 'name', '') in ['Video', 'Record', 'File'] for comp in components)
+        if has_downloadable_content:
+            for comp in components:
+                comp_type_name = getattr(comp.type, 'name', 'unknown')
+
+                if comp_type_name == 'Video':
+                    file_id = getattr(comp, 'file', None)
+                    if not file_id:
+                        continue
+
+                    video_size = raw_video_sizes.get(file_id)
+                    if video_size and self.file_size_threshold_mb > 0:
+                        video_size_mb = video_size / (1024 * 1024)
+                        if video_size_mb > self.file_size_threshold_mb:
+                            setattr(comp, 'file', f'[视频过大未缓存: {video_size_mb:.2f} MB]')
                             continue
-                        if segment.get("type") == "file":
-                            file_name = segment.get("data", {}).get("file")
-                            file_size = segment.get("data", {}).get("file_size")
-                            if file_name:
-                                raw_file_names.append(file_name)
-                            if file_size:
-                                try:
-                                    raw_file_sizes[file_name] = int(file_size) if isinstance(file_size, str) else file_size
-                                except ValueError:
-                                    logger.warning(f"[AntiRevoke] 无法解析文件大小: {file_size}")
-                        elif segment.get("type") == "video":
-                            file_id = segment.get("data", {}).get("file")
-                            file_size = segment.get("data", {}).get("file_size")
-                            if file_id and file_size:
-                                try:
-                                    raw_video_sizes[file_id] = int(file_size) if isinstance(file_size, str) else file_size
-                                except ValueError:
-                                    logger.warning(f"[AntiRevoke] 无法解析视频大小: {file_size}")
-                        elif segment.get("type") == "record":
-                            file_id = segment.get("data", {}).get("file")
-                            url = segment.get("data", {}).get("url")
-                            if file_id:
-                                if url: raw_record_urls[file_id] = url
-            except Exception as e:
-                logger.warning(f"[AntiRevoke] 解析 raw_message 失败: {e}")
-            
-            local_file_map = {}
-            has_downloadable_content = any(getattr(comp.type, 'name', '') in ['Video', 'Record', 'File'] for comp in components)
 
-            if has_downloadable_content:
-                client = event.bot
-                for comp in components:
-                    comp_type_name = getattr(comp.type, 'name', 'unknown')
-                    
-                    if comp_type_name == 'Video':
-                        file_id = getattr(comp, 'file', None)
-                        if not file_id: continue
-                        
-                        video_size = raw_video_sizes.get(file_id)
-                        if video_size and self.file_size_threshold_mb > 0:
-                            video_size_mb = video_size / (1024 * 1024)
-                            if video_size_mb > self.file_size_threshold_mb:
-                                logger.info(f"[{self.instance_id}] 视频大小 ({video_size_mb:.2f} MB) 超过阈值 ({self.file_size_threshold_mb} MB)，跳过缓存。")
-                                setattr(comp, 'file', f"[视频过大未缓存: {video_size_mb:.2f} MB]")
-                                continue
-                        
-                        try:
-                            ret = await client.api.call_action('get_file', **{"file_id": file_id})
-                            download_url = ret.get('url')
-                            if not download_url:
-                                setattr(comp, 'file', "Error: API did not return a URL.")
-                                continue
-                            
-                            file_size_from_api = ret.get('file_size')
-                            if file_size_from_api and self.file_size_threshold_mb > 0:
-                                try:
-                                    file_size_int = int(file_size_from_api) if isinstance(file_size_from_api, str) else file_size_from_api
-                                    api_size_mb = file_size_int / (1024 * 1024)
-                                    if api_size_mb > self.file_size_threshold_mb:
-                                        logger.info(f"[{self.instance_id}] 视频大小 ({api_size_mb:.2f} MB) 超过阈值 ({self.file_size_threshold_mb} MB)，跳过缓存。")
-                                        setattr(comp, 'file', f"[视频过大未缓存: {api_size_mb:.2f} MB]")
-                                        continue
-                                except (ValueError, TypeError) as e:
-                                    logger.warning(f"[{self.instance_id}] 无法解析API返回的文件大小: {file_size_from_api}")
-                            
-                            original_filename = getattr(comp, 'name', file_id.split('/')[-1])
-                            if not original_filename or len(original_filename) < 5:
-                                original_filename = f"{timestamp_ms}.mp4"
-                            
-                            dest_path = self.video_cache_path / f"{timestamp_ms}_{original_filename}"
-                            if await self._download_video_from_url(download_url, dest_path):
-                                setattr(comp, 'file', str(dest_path.absolute()))
-                                asyncio.create_task(delayed_delete(self.cache_expiration_time, dest_path))
-                            else:
-                                setattr(comp, 'file', f"Error: Download failed from {download_url}")
-                        except Exception as e:
-                            logger.error(f"[{self.instance_id}] ❌ 处理视频缓存时发生错误: {e}\n{traceback.format_exc()}")
-                            setattr(comp, 'file', "Error: Exception during cache process.")
+                    try:
+                        ret = await client.api.call_action('get_file', **{'file_id': file_id})
+                        download_url = ret.get('url')
+                        if not download_url:
+                            setattr(comp, 'file', 'Error: API did not return a URL.')
+                            continue
 
-                    elif comp_type_name == 'Record':
-                        file_id = getattr(comp, 'file', None)
-                        if not file_id: continue
-                        
-                        try:
-                            # 1. 尝试从组件属性或原始消息中获取 url 并下载
-                            record_url = getattr(comp, 'url', None) or raw_record_urls.get(file_id)
-                            if record_url:
-                                try:
-                                    original_suffix = '.amr'
-                                    # 尝试从 url 或文件名推断后缀
-                                    if getattr(comp, 'file', '').endswith('.slk'):
-                                        original_suffix = '.slk'
-                                    
-                                    permanent_path = self.voice_cache_path / f"{timestamp_ms}{original_suffix}"
-                                    
-                                    headers = {'User-Agent': 'Mozilla/5.0 ...'}
-                                    async with aiohttp.ClientSession() as session:
-                                        async with session.get(record_url, headers=headers, timeout=15) as response:
-                                            response.raise_for_status()
-                                            voice_bytes = await response.read()
-                                            with open(permanent_path, 'wb') as f:
-                                                f.write(voice_bytes)
-                                    
-                                    os.chmod(permanent_path, 0o644)
-
-                                    setattr(comp, 'file', str(permanent_path.absolute()))
-                                    asyncio.create_task(delayed_delete(self.cache_expiration_time, permanent_path))
+                        file_size_from_api = ret.get('file_size')
+                        if file_size_from_api and self.file_size_threshold_mb > 0:
+                            try:
+                                file_size_int = int(file_size_from_api) if isinstance(file_size_from_api, str) else file_size_from_api
+                                api_size_mb = file_size_int / (1024 * 1024)
+                                if api_size_mb > self.file_size_threshold_mb:
+                                    setattr(comp, 'file', f'[视频过大未缓存: {api_size_mb:.2f} MB]')
                                     continue
-                                except Exception as e:
-                                    logger.warning(f"[{self.instance_id}] [Record处理] 尝试通过 URL 下载失败: {e}，将尝试使用本地路径兜底。")
-                            
-                            # 2. 如果 URL 失败或不存在，尝试通过 API 获取本地路径并拷贝
-                            ret = await client.api.call_action('get_file', **{"file_id": file_id})
-                            local_path = ret.get('file')
-                            
-                            if not local_path or not os.path.exists(local_path):
-                                logger.error(f"[{self.instance_id}] [Record处理] ❌ API未能提供有效的本地文件路径。返回: {ret}")
-                                setattr(comp, 'file', "Error: API did not return a valid file path.")
-                                continue
-                            
-                            original_suffix = Path(local_path).suffix or '.amr'
-                            permanent_path = self.voice_cache_path / f"{timestamp_ms}{original_suffix}"
-                            shutil.copy(local_path, permanent_path)
-                            # ========== 添加权限设置 ==========
-                            os.chmod(permanent_path, 0o644)  # 设置文件权限为 rw-r--r--
-                            # ================================
+                            except (ValueError, TypeError):
+                                logger.warning(f'[{self.instance_id}] 无法解析API返回的文件大小: {file_size_from_api}')
 
-                            setattr(comp, 'file', str(permanent_path.absolute()))
-                            asyncio.create_task(delayed_delete(self.cache_expiration_time, permanent_path))
-                            
-                        except Exception as e:
-                            logger.error(f"[{self.instance_id}] ❌ 处理 Record 缓存时发生错误: {e}\n{traceback.format_exc()}")
-                            setattr(comp, 'file', "Error: Exception during cache process.")
+                        original_filename = getattr(comp, 'name', file_id.split('/')[-1])
+                        if not original_filename or len(original_filename) < 5:
+                            original_filename = f'{timestamp_ms}.mp4'
 
-                    elif comp_type_name == 'File':
-                        try:
-                            original_filename = None
-                            if raw_file_names:
-                                original_filename = raw_file_names[0]
-                            
-                            file_size = raw_file_sizes.get(original_filename) if original_filename else None
-                            if file_size and self.file_size_threshold_mb > 0:
-                                file_size_mb = file_size / (1024 * 1024)
-                                if file_size_mb > self.file_size_threshold_mb:
-                                    logger.info(f"[{self.instance_id}] 文件 '{original_filename}' 大小 ({file_size_mb:.2f} MB) 超过阈值 ({self.file_size_threshold_mb} MB)，跳过缓存。")
-                                    unique_key = getattr(comp, 'url', None)
-                                    if unique_key:
-                                        local_file_map[unique_key] = f"[文件过大未缓存: {file_size_mb:.2f} MB, 文件名: {original_filename}]"
-                                    if raw_file_names:
-                                        raw_file_names.pop(0)
-                                    continue
-                            
-                            temp_file_path = await comp.get_file()
-                            if not temp_file_path or not os.path.exists(temp_file_path):
-                                logger.error(f"[{self.instance_id}] [File处理] ❌ 框架未能提供有效的临时文件路径。")
-                                continue
+                        dest_path = self.video_cache_path / f'{timestamp_ms}_{original_filename}'
+                        if await self._download_video_from_url(download_url, dest_path):
+                            setattr(comp, 'file', str(dest_path.absolute()))
+                            asyncio.create_task(delayed_delete(self.cache_expiration_time, dest_path))
+                        else:
+                            setattr(comp, 'file', f'Error: Download failed from {download_url}')
+                    except Exception as exc:
+                        logger.error(f'[{self.instance_id}] ❌ 处理视频缓存时发生错误: {exc}\n{traceback.format_exc()}')
+                        setattr(comp, 'file', 'Error: Exception during cache process.')
 
-                            if not original_filename and raw_file_names:
-                                original_filename = raw_file_names.pop(0)
-                            
-                            if not original_filename:
-                                original_filename = getattr(comp, 'name', Path(temp_file_path).name)
-                                logger.warning(f"[AntiRevoke] [File处理] raw_message 中无可用文件名，回退为: {original_filename}")
+                elif comp_type_name == 'Record':
+                    file_id = getattr(comp, 'file', None)
+                    if not file_id:
+                        continue
 
-                            if not original_filename or original_filename == Path(temp_file_path).name:
-                                original_filename = f"未知文件_{timestamp_ms}.dat"
-
-                            permanent_path = self.file_cache_path / f"{timestamp_ms}_{original_filename}"
-                            shutil.copy(temp_file_path, permanent_path)
-
-                            unique_key = getattr(comp, 'url', None)
-                            if unique_key:
-                                local_file_map[unique_key] = str(permanent_path)
+                    try:
+                        record_url = getattr(comp, 'url', None) or raw_record_urls.get(file_id)
+                        if record_url:
+                            try:
+                                original_suffix = '.amr'
+                                if getattr(comp, 'file', '').endswith('.slk'):
+                                    original_suffix = '.slk'
+                                permanent_path = self.voice_cache_path / f'{timestamp_ms}{original_suffix}'
+                                headers = {'User-Agent': 'Mozilla/5.0 ...'}
+                                async with aiohttp.ClientSession() as session:
+                                    async with session.get(record_url, headers=headers, timeout=15) as response:
+                                        response.raise_for_status()
+                                        voice_bytes = await response.read()
+                                        with open(permanent_path, 'wb') as f:
+                                            f.write(voice_bytes)
+                                os.chmod(permanent_path, 0o644)
+                                setattr(comp, 'file', str(permanent_path.absolute()))
                                 asyncio.create_task(delayed_delete(self.cache_expiration_time, permanent_path))
-                            else:
-                                logger.warning(f"[{self.instance_id}] ⚠️ File 组件缺少 URL，无法为其创建映射。")
+                                continue
+                            except Exception as exc:
+                                logger.warning(f'[{self.instance_id}] [Record处理] 尝试通过 URL 下载失败: {exc}，将尝试使用本地路径兜底。')
 
-                        except Exception as e:
-                            logger.error(f"[{self.instance_id}] ❌ 处理 File 缓存时发生错误: {e}\n{traceback.format_exc()}")
-            
-            file_path = self.temp_path / f'{timestamp_ms}_{group_id}_{message_id}.json'
-            with open(file_path, 'w', encoding='utf-8') as f:
-                data_to_save = {
-                    "components": _serialize_components(components),
-                    "sender_id": event.get_sender_id(),
-                    "timestamp": event.message_obj.timestamp,
-                    "local_file_map": local_file_map,
-                    "relay_info": relay_info
-                }
-                json.dump(data_to_save, f, ensure_ascii=False, indent=2)
+                        ret = await client.api.call_action('get_file', **{'file_id': file_id})
+                        local_path = ret.get('file')
+                        if not local_path or not os.path.exists(local_path):
+                            setattr(comp, 'file', 'Error: API did not return a valid file path.')
+                            continue
 
-            asyncio.create_task(delayed_delete(self.cache_expiration_time, file_path))
-        except Exception as e:
-            logger.error(f"[{self.instance_id}] 缓存消息失败 (ID: {message_id})：{e}\n{traceback.format_exc()}")
-        return None
+                        original_suffix = Path(local_path).suffix or '.amr'
+                        permanent_path = self.voice_cache_path / f'{timestamp_ms}{original_suffix}'
+                        shutil.copy(local_path, permanent_path)
+                        os.chmod(permanent_path, 0o644)
+                        setattr(comp, 'file', str(permanent_path.absolute()))
+                        asyncio.create_task(delayed_delete(self.cache_expiration_time, permanent_path))
+                    except Exception as exc:
+                        logger.error(f'[{self.instance_id}] ❌ 处理 Record 缓存时发生错误: {exc}\n{traceback.format_exc()}')
+                        setattr(comp, 'file', 'Error: Exception during cache process.')
+
+                elif comp_type_name == 'File':
+                    try:
+                        original_filename = raw_file_names[0] if raw_file_names else None
+                        file_size = raw_file_sizes.get(original_filename) if original_filename else None
+                        if file_size and self.file_size_threshold_mb > 0:
+                            file_size_mb = file_size / (1024 * 1024)
+                            if file_size_mb > self.file_size_threshold_mb:
+                                unique_key = getattr(comp, 'url', None)
+                                if unique_key:
+                                    local_file_map[unique_key] = f'[文件过大未缓存: {file_size_mb:.2f} MB, 文件名: {original_filename}]'
+                                if raw_file_names:
+                                    raw_file_names.pop(0)
+                                continue
+
+                        temp_file_path = await self._get_file_with_retry(comp)
+                        if not temp_file_path or not os.path.exists(temp_file_path):
+                            continue
+
+                        if not original_filename and raw_file_names:
+                            original_filename = raw_file_names.pop(0)
+                        if not original_filename:
+                            original_filename = getattr(comp, 'name', Path(temp_file_path).name)
+                        if not original_filename or original_filename == Path(temp_file_path).name:
+                            original_filename = f'未知文件_{timestamp_ms}.dat'
+
+                        permanent_path = self.file_cache_path / f'{timestamp_ms}_{original_filename}'
+                        shutil.copy(temp_file_path, permanent_path)
+
+                        unique_key = getattr(comp, 'url', None)
+                        if unique_key:
+                            local_file_map[unique_key] = str(permanent_path)
+                            asyncio.create_task(delayed_delete(self.cache_expiration_time, permanent_path))
+                    except Exception as exc:
+                        logger.error(f'[{self.instance_id}] ❌ 处理 File 缓存时发生错误: {exc}\n{traceback.format_exc()}')
+
+        file_path = cache_file if isinstance(cache_file, Path) else self._get_cache_file_path(group_id, message_id)
+        self._write_cache_record(
+            file_path,
+            {
+                "status": "done",
+                "group_id": group_id,
+                "message_id": message_id,
+                "sender_id": sender_id,
+                "timestamp": timestamp,
+                "components": _serialize_components(components),
+                "local_file_map": local_file_map,
+                "relay_info": relay_info,
+            },
+        )
+
+        asyncio.create_task(delayed_delete(self.cache_expiration_time, file_path))
+        return {"file_path": str(file_path), "relay_info": relay_info}
 
     def _create_recall_notification_header(self, group_name: str, group_id: str, member_nickname: str, sender_id: str, operator_nickname: str, operator_id: str, timestamp: int) -> str:
         """生成统一的撤回通知消息头"""
@@ -851,30 +1043,42 @@ class AntiRevoke(Star):
             group_id = str(get_value(raw_message, "group_id"))
             message_id = str(get_value(raw_message, "message_id"))
             operator_id = str(get_value(raw_message, "operator_id"))
+            recall_sender_id = str(get_value(raw_message, "user_id"))
             if group_id not in self.monitor_groups or not message_id: return None
+
+            client = event.bot
+            early_group_name, early_member_nickname, _ = await self._get_group_context_names(
+                client,
+                group_id,
+                sender_id=recall_sender_id,
+                operator_id=None,
+            )
+            logger.info(
+                f"[{self.instance_id}] 发现撤回。群: {early_group_name} ({group_id}), "
+                f"发送者: {early_member_nickname} ({recall_sender_id or '未知'})"
+            )
             
-            file_path = next(self.temp_path.glob(f"*_{group_id}_{message_id}.json"), None)
+            cache_key = build_cache_task_key(group_id, message_id)
+            file_path = self._get_cache_file_path(group_id, message_id)
+            cached_data = await self._poll_cache_record(group_id, message_id)
 
-            # 最大等待时间为缓存过期时间，优化大文件消息以及秒撤回的使用场景
-            if not file_path or not file_path.exists():
-                max_retries = self.cache_expiration_time  # 1s 一次
-                for i in range(max_retries): 
-                    await asyncio.sleep(1) 
-                    file_path = next(self.temp_path.glob(f"*_{group_id}_{message_id}.json"), None)
-                    if file_path and file_path.exists():
-                        break
-                else:
-                    logger.warning(f"[{self.instance_id}] 等待 {self.cache_expiration_time} 秒后仍未找到消息记录 (ID: {message_id})，停止等待。")
+            if not cached_data and cache_key in self._cache_tasks:
+                task_result = await self._wait_for_cache_task_result(cache_key, timeout=self.cache_expiration_time)
+                if task_result and task_result.get("file_path"):
+                    file_path = Path(task_result["file_path"])
+                    cached_data = self._load_cached_data(file_path)
 
-            cached_data = None
+            if not cached_data:
+                file_path = self._find_cache_file(group_id, message_id)
+                cached_data = self._load_cached_data(file_path)
 
-            if file_path and file_path.exists():
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        cached_data = json.load(f)
-                except Exception as e:
-                    logger.warning(f"[{self.instance_id}] 读取或解析本地缓存失败: {e}")
-            
+            if cached_data and cached_data.get("status") == "failed":
+                logger.warning(f"[{self.instance_id}] 消息缓存失败，跳过撤回恢复（ID: {message_id}）。")
+                return None
+            if cached_data and cached_data.get("status") == "pending":
+                logger.warning(f"[{self.instance_id}] 消息缓存仍在进行中，跳过撤回恢复（ID: {message_id}）。")
+                return None
+
             # 如果没有找到缓存数据，则无法恢复
             if not cached_data:
                 logger.warning(f"[{self.instance_id}] 找不到消息记录 (ID: {message_id})，可能已过期或未缓存。")
@@ -896,23 +1100,12 @@ class AntiRevoke(Star):
                 
                 try:
                     client = event.bot
-                    
-                    # 获取群名和用户名和操作员
-                    group_name, member_nickname, operator_nickname = str(group_id), str(sender_id), str(operator_id)
-                    try:
-                        group_info = await client.api.call_action('get_group_info', group_id=int(group_id))
-                        group_name = group_info.get('group_name', group_name)
-                    except: pass
-                    try:
-                        member_info = await client.api.call_action('get_group_member_info', group_id=int(group_id), user_id=int(sender_id))
-                        card, nickname = member_info.get('card', ''), member_info.get('nickname', '')
-                        member_nickname = card or nickname or member_nickname
-                    except: pass
-                    try:
-                        operator_info = await client.api.call_action('get_group_member_info', group_id=int(group_id), user_id=int(operator_id))
-                        card, nickname = operator_info.get('card', ''), operator_info.get('nickname', '')
-                        operator_nickname = card or nickname or operator_nickname
-                    except: pass
+                    group_name, member_nickname, operator_nickname = await self._get_group_context_names(
+                        client,
+                        group_id,
+                        sender_id=sender_id,
+                        operator_id=operator_id,
+                    )
                     
                     logger.info(f"[{self.instance_id}] 合并转发撤回 - 群: {group_name}, 发送者: {member_nickname}, 操作者: {operator_nickname} ({operator_id})")
                     
@@ -980,20 +1173,13 @@ class AntiRevoke(Star):
 
                     timestamp = cached_data.get("timestamp")
                     client = event.bot
-                    
-                    group_name, member_nickname, operator_nickname = str(group_id), str(sender_id), str(operator_id)
-                    try:
-                        group_info = await client.api.call_action('get_group_info', group_id=int(group_id)); group_name = group_info.get('group_name', group_name)
-                    except: pass
-                    try:
-                        member_info = await client.api.call_action('get_group_member_info', group_id=int(group_id), user_id=int(sender_id)); card, nickname = member_info.get('card', ''), member_info.get('nickname', ''); member_nickname = card or nickname or member_nickname
-                    except: pass
-                    try:
-                        operator_info = await client.api.call_action('get_group_member_info', group_id=int(group_id), user_id=int(operator_id)); card, nickname = operator_info.get('card', ''), operator_info.get('nickname', ''); operator_nickname = card or nickname or operator_nickname
-                    except: pass
+                    group_name, member_nickname, operator_nickname = await self._get_group_context_names(
+                        client,
+                        group_id,
+                        sender_id=sender_id,
+                        operator_id=operator_id,
+                    )
 
-                    logger.info(f"[{self.instance_id}] 发现撤回。群: {group_name} ({group_id}), 发送者: {member_nickname} ({sender_id})")
-                    
                     special_components = [comp for comp in components if getattr(comp.type, 'name', 'unknown') in ['Video', 'Record', 'Json', 'File', 'Forward']]
                     other_components = [comp for comp in components if getattr(comp.type, 'name', 'unknown') not in ['Video', 'Record', 'Json', 'File', 'Forward']]
                     
