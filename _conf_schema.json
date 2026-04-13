@@ -23,6 +23,12 @@
     "hint": "来自列表中的 QQ 用户的消息不会被处理。",
     "default": []
   },
+  "ignore_operators": {
+    "type": "list",
+    "description": "忽略操作者列表",
+    "hint": "由列表中的用户执行的撤回不会触发通知。",
+    "default": []
+  },
   "cache_expiration_time": {
     "type": "int",
     "description": "缓存保留时长（秒）",

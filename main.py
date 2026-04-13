@@ -233,6 +233,7 @@ class AntiRevoke(Star):
         self.target_receivers = [str(r) for r in config.get("target_receivers", []) or []]
         self.target_groups = [str(g) for g in config.get("target_groups", []) or []]
         self.ignore_senders = [str(s) for s in config.get("ignore_senders", []) or []]
+        self.ignore_operators = [str(o) for o in config.get("ignore_operators", []) or []]
         self.instance_id = "AntiRevoke"
         self.cache_expiration_time = int(config.get("cache_expiration_time", 300))
         self.cache_pending_timeout = min(self.cache_expiration_time, 2)
@@ -1045,6 +1046,9 @@ class AntiRevoke(Star):
             operator_id = str(get_value(raw_message, "operator_id"))
             recall_sender_id = str(get_value(raw_message, "user_id"))
             if group_id not in self.monitor_groups or not message_id: return None
+            if operator_id in self.ignore_operators:
+                logger.debug(f"[{self.instance_id}] 操作者 {operator_id} 在忽略列表中，跳过处理")
+                return None
 
             client = event.bot
             early_group_name, early_member_nickname, _ = await self._get_group_context_names(
@@ -1158,7 +1162,12 @@ class AntiRevoke(Star):
                 try:
                     sender_id = cached_data["sender_id"]
                     local_file_map = cached_data.get("local_file_map", {})
-                    if str(sender_id) in self.ignore_senders: return None
+                    if str(sender_id) in self.ignore_senders:
+                        logger.debug(f"[{self.instance_id}] 发送者 {sender_id} 在忽略列表中，跳过处理")
+                        return None
+                    if operator_id in self.ignore_operators:
+                        logger.debug(f"[{self.instance_id}] 操作人 {operator_id} 在忽略列表中，跳过处理")
+                        return None
                     
                     cached_components_data = cached_data.get("components", [])
                     
