@@ -35,6 +35,18 @@
     "hint": "消息缓存和临时文件的过期时间，默认 300 秒。",
     "default": 300
   },
+  "enable_text_screenshot": {
+    "type": "bool",
+    "description": "文本撤回附带聊天截图",
+    "hint": "开启后，纯文本类撤回会额外发送一张仿 QQ 聊天截图。",
+    "default": false
+  },
+  "show_title": {
+    "type": "bool",
+    "description": "显示头衔徽标",
+    "hint": "生成的聊天截图是否显示群头衔/等级徽标。",
+    "default": true
+  },
   "file_size_threshold_mb": {
     "type": "int",
     "description": "媒体大小阈值（MB）",

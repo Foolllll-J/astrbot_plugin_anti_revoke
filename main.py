@@ -18,6 +18,7 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.platform import MessageType
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
+from .rendering.chat_screenshot import generate_text_recall_screenshot
 
 
 def build_cache_task_key(group_id: str, message_id: str) -> str:
@@ -243,6 +244,8 @@ class AntiRevoke(Star):
         self.forward_relay_group = str(config.get("forward_relay_group", "") or "")
         self.forward_to_self = config.get("forward_to_self", False)
         self.auto_recall_relay = config.get("auto_recall_relay", True)
+        self.enable_text_screenshot = config.get("enable_text_screenshot", False)
+        self.show_title = config.get("show_title", True)
         self.context = context
         self.temp_path = Path(StarTools.get_data_dir("astrbot_plugin_anti_revoke"))
         self.temp_path.mkdir(exist_ok=True)
@@ -588,6 +591,81 @@ class AntiRevoke(Star):
             msg += f"群 {gid} -> {', '.join(targets)}\n"
         
         yield event.plain_result(msg.strip())
+
+    def _extract_text_for_screenshot(self, components: list) -> str:
+        if not components:
+            return ""
+
+        allowed_types = {"Plain", "Text", "At", "Face"}
+        parts: list[str] = []
+        has_text_content = False
+
+        for comp in components:
+            comp_type_name = getattr(comp.type, "name", "unknown")
+            if comp_type_name not in allowed_types:
+                return ""
+
+            if comp_type_name in {"Plain", "Text"}:
+                text = str(getattr(comp, "text", "") or "")
+                if text:
+                    has_text_content = True
+                    parts.append(text)
+            elif comp_type_name == "At":
+                qq = getattr(comp, "qq", "")
+                name = getattr(comp, "name", "") or qq
+                if name:
+                    has_text_content = True
+                    parts.append(f"@{name} ")
+            elif comp_type_name == "Face":
+                parts.append("[表情]")
+
+        if not has_text_content:
+            return ""
+        return "".join(parts).strip()
+
+    async def _send_text_recall_screenshot(
+        self,
+        client,
+        target_type: str,
+        target_id_str: str,
+        group_id: str,
+        sender_id: str,
+        member_nickname: str,
+        text: str,
+    ) -> None:
+        if not self.enable_text_screenshot or not text:
+            return
+
+        try:
+            image_bytes = await generate_text_recall_screenshot(
+                client=client,
+                group_id=int(group_id),
+                user_id=int(sender_id),
+                text=text,
+                fallback_name=member_nickname,
+                show_title=self.show_title,
+            )
+            if not image_bytes:
+                return
+
+            image_message = [
+                {
+                    "type": "image",
+                    "data": {
+                        "file": f"base64://{base64.b64encode(image_bytes).decode('utf-8')}",
+                    },
+                }
+            ]
+            await self._send_with_text_fallback(
+                client,
+                target_type,
+                target_id_str,
+                image_message,
+                "发送文本撤回聊天截图",
+                "[聊天截图发送失败]",
+            )
+        except Exception as exc:
+            logger.error(f"[{self.instance_id}] failed to send text recall screenshot: {exc}")
 
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=20)
@@ -1196,6 +1274,7 @@ class AntiRevoke(Star):
                         targets = await self._get_targets_for_group(group_id)
                         for target_type, target_id in targets:
                             target_id_str = str(target_id)
+                            text_screenshot_content = self._extract_text_for_screenshot(other_components)
                             
                             notification_prefix = self._create_recall_notification_header(group_name, group_id, member_nickname,sender_id, operator_nickname, operator_id, timestamp)
                             warning_text = f"\n⚠️ 注意：包含不支持的组件：{', '.join(unsupported_types)}" if unsupported_types else ""
@@ -1224,6 +1303,15 @@ class AntiRevoke(Star):
                                         fallback_text = f"{notification_prefix}{warning_text}\n--------------------\n[原消息发送失败，且无法提取可展示内容]"
                                     await self._send_with_text_fallback(
                                         client, target_type, target_id_str, gocq_content_array, "合并消息转发", fallback_text
+                                    )
+                                    await self._send_text_recall_screenshot(
+                                        client,
+                                        target_type,
+                                        target_id_str,
+                                        group_id,
+                                        sender_id,
+                                        member_nickname,
+                                        text_screenshot_content,
                                     )
                             else:
                                 final_notification_text = f"{notification_prefix}{warning_text}\n--------------------\n内容将分条发送。"
