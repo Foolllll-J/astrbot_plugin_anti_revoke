@@ -617,7 +617,7 @@ class AntiRevoke(Star):
                     has_text_content = True
                     parts.append(f"@{name} ")
             elif comp_type_name == "Face":
-                parts.append("[表情]")
+                continue
 
         if not has_text_content:
             return ""

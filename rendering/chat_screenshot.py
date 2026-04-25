@@ -1,3 +1,4 @@
+import importlib
 import io
 import random
 import re
@@ -7,47 +8,79 @@ import aiohttp
 from astrbot import logger
 from PIL import Image, ImageDraw, ImageFont
 
-try:
-    from pilmoji import Pilmoji
-except ImportError:
-    Pilmoji = None
 
-try:
-    import emoji
-    from emoji import unicode_codes
+RESOURCES_DIR = Path(__file__).parent.parent / "resources"
+FONT_PATH = RESOURCES_DIR / "fonts" / "NotoSansSC-Regular.ttf"
+FONT_BOLD_PATH = RESOURCES_DIR / "fonts" / "NotoSansSC-Bold.ttf"
+
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F1E6-\U0001F1FF"
+    "\U0001F300-\U0001F5FF"
+    "\U0001F600-\U0001F64F"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F700-\U0001F77F"
+    "\U0001F780-\U0001F7FF"
+    "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FAFF"
+    "\U00002702-\U000027B0"
+    "\U000024C2-\U0001F251"
+    "\U00002600-\U000026FF"
+    "]+",
+    flags=re.UNICODE,
+)
+EMOJI_EXTRA_PATTERN = re.compile(r"[\u200d\uFE0E\uFE0F]")
+FACE_PLACEHOLDER_PATTERN = re.compile(r"\[\s*表情\s*\]")
+
+_PILMOJI_CLASS = None
+_PILMOJI_STATUS = "unknown"
+
+
+def _patch_emoji_unicode_codes() -> None:
+    emoji_module = importlib.import_module("emoji")
+    unicode_codes = importlib.import_module("emoji.unicode_codes")
 
     if not hasattr(unicode_codes, "get_emoji_unicode_dict"):
-        def get_emoji_unicode_dict(lang):
+        def get_emoji_unicode_dict(lang: str):
+            emoji_data = getattr(emoji_module, "EMOJI_DATA", {}) or {}
             return {
                 data[lang]: char
-                for char, data in emoji.EMOJI_DATA.items()
-                if lang in data
+                for char, data in emoji_data.items()
+                if isinstance(data, dict) and lang in data
             }
 
         unicode_codes.get_emoji_unicode_dict = get_emoji_unicode_dict
 
     if not hasattr(unicode_codes, "EMOJI_UNICODE"):
-        unicode_codes.EMOJI_UNICODE = {"en": get_emoji_unicode_dict("en")}
-
-    if not hasattr(emoji, "get_emoji_regexp"):
-        _emoji_regexp = None
-
-        def get_emoji_regexp():
-            global _emoji_regexp
-            if _emoji_regexp is None:
-                emojis = sorted(emoji.EMOJI_DATA.keys(), key=len, reverse=True)
-                pattern = "|".join(re.escape(item) for item in emojis)
-                _emoji_regexp = re.compile(pattern)
-            return _emoji_regexp
-
-        emoji.get_emoji_regexp = get_emoji_regexp
-except ImportError:
-    emoji = None
+        unicode_codes.EMOJI_UNICODE = {"en": unicode_codes.get_emoji_unicode_dict("en")}
 
 
-RESOURCES_DIR = Path(__file__).parent.parent / "resources"
-FONT_PATH = RESOURCES_DIR / "fonts" / "NotoSansSC-Regular.ttf"
-FONT_BOLD_PATH = RESOURCES_DIR / "fonts" / "NotoSansSC-Bold.ttf"
+def _get_pilmoji_class():
+    global _PILMOJI_CLASS, _PILMOJI_STATUS
+
+    if _PILMOJI_STATUS == "available":
+        return _PILMOJI_CLASS
+    if _PILMOJI_STATUS == "unavailable":
+        return None
+
+    try:
+        _patch_emoji_unicode_codes()
+        pilmoji_module = importlib.import_module("pilmoji")
+        _PILMOJI_CLASS = getattr(pilmoji_module, "Pilmoji", None)
+        if _PILMOJI_CLASS is None:
+            raise AttributeError("pilmoji.Pilmoji not found")
+        _PILMOJI_STATUS = "available"
+        logger.info("[AntiRevoke] emoji rendering enabled via pilmoji")
+        return _PILMOJI_CLASS
+    except Exception as exc:
+        _PILMOJI_STATUS = "unavailable"
+        _PILMOJI_CLASS = None
+        logger.warning(
+            "[AntiRevoke] emoji rendering unavailable, fallback to emoji filtering: %s",
+            exc,
+        )
+        return None
 
 
 def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
@@ -65,6 +98,15 @@ def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
         except Exception:
             pass
     return ImageFont.load_default()
+
+
+def sanitize_display_text(text: str, preserve_emoji: bool = False) -> str:
+    cleaned = str(text or "")
+    cleaned = FACE_PLACEHOLDER_PATTERN.sub("", cleaned)
+    if not preserve_emoji:
+        cleaned = EMOJI_PATTERN.sub("", cleaned)
+        cleaned = EMOJI_EXTRA_PATTERN.sub("", cleaned)
+    return cleaned.strip()
 
 
 def wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
@@ -91,16 +133,6 @@ def wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[s
     return lines
 
 
-def pad_emojis(text: str) -> str:
-    if not emoji:
-        return text
-    try:
-        pattern = emoji.get_emoji_regexp()
-        return re.sub(pattern, lambda match: f" {match.group(0)} ", text)
-    except Exception:
-        return text
-
-
 def draw_rounded_rectangle(draw: ImageDraw.ImageDraw, xy, corner_radius, fill=None, outline=None):
     draw.rounded_rectangle(xy, radius=corner_radius, fill=fill, outline=outline)
 
@@ -112,10 +144,23 @@ def make_italic(image: Image.Image, skew_factor: float = 0.1) -> Image.Image:
     return image.transform((new_width, height), Image.AFFINE, matrix, resample=Image.BICUBIC)
 
 
+def _draw_text(image: Image.Image, position: tuple[int, int], text: str, font, fill, emoji_offset_y: int = 0) -> None:
+    pilmoji_class = _get_pilmoji_class()
+    if pilmoji_class:
+        with pilmoji_class(image, emoji_position_offset=(0, emoji_offset_y)) as pilmoji:
+            pilmoji.text(position, text, font=font, fill=fill)
+        return
+
+    draw = ImageDraw.Draw(image)
+    draw.text(position, sanitize_display_text(text), font=font, fill=fill)
+
+
 def make_dialog_box(text: str, name_w: int) -> Image.Image:
     font_size = 55
     font = load_font(font_size, bold=False)
-    lines = wrap_text(pad_emojis(text), font, 900)
+    preserve_emoji = _get_pilmoji_class() is not None
+    display_text = sanitize_display_text(text, preserve_emoji=preserve_emoji)
+    lines = wrap_text(display_text, font, 900)
 
     text_width = 0
     text_height = 0
@@ -158,16 +203,10 @@ def make_dialog_box(text: str, name_w: int) -> Image.Image:
     text_start_y = 17 + (box_h - 40 - text_height) // 2
     current_y = text_start_y
 
-    if Pilmoji:
-        emoji_offset_y = max(1, int(descent * 0.9))
-        with Pilmoji(box, emoji_position_offset=(0, emoji_offset_y)) as pilmoji:
-            for line in lines:
-                pilmoji.text((text_start_x, current_y), line, font=font, fill="black")
-                current_y += line_height + line_spacing
-    else:
-        for line in lines:
-            fill_draw.text((text_start_x, current_y), line, font=font, fill="black")
-            current_y += line_height + line_spacing
+    emoji_offset_y = max(1, int(descent * 0.9))
+    for line in lines:
+        _draw_text(box, (text_start_x, current_y), line, font, "black", emoji_offset_y=emoji_offset_y)
+        current_y += line_height + line_spacing
 
     return box
 
@@ -192,8 +231,13 @@ def render_chat_screenshot(
     avatar = avatar.resize((135, 135))
     avatar.putalpha(mask)
 
+    preserve_emoji = _get_pilmoji_class() is not None
+    safe_name = sanitize_display_text(name, preserve_emoji=preserve_emoji) or "未知用户"
+    safe_title = sanitize_display_text(title, preserve_emoji=preserve_emoji)
+    safe_text = sanitize_display_text(text, preserve_emoji=preserve_emoji)
+
     name_font = load_font(35, bold=False)
-    name_bbox = name_font.getbbox(name)
+    name_bbox = name_font.getbbox(safe_name)
     name_w = name_bbox[2] - name_bbox[0]
     name_h = name_bbox[3] - name_bbox[1]
 
@@ -235,8 +279,8 @@ def render_chat_screenshot(
         if bbox:
             lv_italic_img = lv_italic_img.crop(bbox)
 
-        final_title = title
-        has_custom_title = bool(title)
+        final_title = safe_title
+        has_custom_title = bool(safe_title)
         if not final_title:
             if role == "owner":
                 final_title = "群主"
@@ -265,14 +309,15 @@ def render_chat_screenshot(
             title_w = title_bbox[2] - title_bbox[0]
             title_h = title_bbox[3] - title_bbox[1]
             title_img = Image.new("RGBA", (title_w + 20, title_h + 20), (0, 0, 0, 0))
-            if Pilmoji:
-                _, t_descent = label_font.getmetrics()
-                emoji_offset_y = max(1, int(t_descent * 0.6))
-                with Pilmoji(title_img, emoji_position_offset=(0, emoji_offset_y)) as pilmoji:
-                    pilmoji.text((-title_bbox[0] + 10, -title_bbox[1] + 10), final_title, font=label_font, fill="white")
-            else:
-                title_draw = ImageDraw.Draw(title_img)
-                title_draw.text((-title_bbox[0] + 10, -title_bbox[1] + 10), final_title, font=label_font, fill="white")
+            emoji_offset_y = max(1, int(label_font.getmetrics()[1] * 0.6))
+            _draw_text(
+                title_img,
+                (-title_bbox[0] + 10, -title_bbox[1] + 10),
+                final_title,
+                label_font,
+                "white",
+                emoji_offset_y=emoji_offset_y,
+            )
             bbox = title_img.getbbox()
             if bbox:
                 title_img = title_img.crop(bbox)
@@ -302,7 +347,7 @@ def render_chat_screenshot(
 
     bubble_x = 165
     badge_x = 195
-    box_img = make_dialog_box(text, 0)
+    box_img = make_dialog_box(safe_text, 0)
     name_x = badge_x + label_w + 10 if show_title and label_img else badge_x
 
     canvas_w = max(name_x + name_w, bubble_x + box_img.width) + 50
@@ -314,14 +359,8 @@ def render_chat_screenshot(
         canvas.paste(label_img, (badge_x, 25), mask=label_img)
 
     name_draw_y = 20 + (35 - name_h) // 2
-    if Pilmoji:
-        _, n_descent = name_font.getmetrics()
-        emoji_offset_y = max(1, int(n_descent * 0.6))
-        with Pilmoji(canvas, emoji_position_offset=(0, emoji_offset_y)) as pilmoji:
-            pilmoji.text((name_x, name_draw_y), name, font=name_font, fill="#868894")
-    else:
-        name_draw = ImageDraw.Draw(canvas)
-        name_draw.text((name_x, name_draw_y), name, font=name_font, fill="#868894")
+    emoji_offset_y = max(1, int(name_font.getmetrics()[1] * 0.6))
+    _draw_text(canvas, (name_x, name_draw_y), safe_name, name_font, "#868894", emoji_offset_y=emoji_offset_y)
 
     output = io.BytesIO()
     canvas.convert("RGB").save(output, format="JPEG", quality=90)
@@ -382,7 +421,8 @@ async def generate_text_recall_screenshot(
     fallback_name: str = "",
     show_title: bool = True,
 ) -> bytes | None:
-    text = (text or "").strip()
+    preserve_emoji = _get_pilmoji_class() is not None
+    text = sanitize_display_text(text, preserve_emoji=preserve_emoji)
     if not text:
         return None
 

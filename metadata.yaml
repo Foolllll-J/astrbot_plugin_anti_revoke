@@ -1,7 +1,7 @@
 name: astrbot_plugin_anti_revoke # 这是你的插件的唯一识别名。
 display_name: QQ 防撤回 # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
 desc: 支持监控 QQ 群被撤回的消息并将撤回通知发送至目标会话。 # 插件简短描述
-version: v1.3.0 # 插件版本号。格式：v1.1.1 或者 v1.1
+version: v1.3.1 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: Foolllll # 作者
 repo: https://github.com/Foolllll-J/astrbot_plugin_anti_revoke # 插件的仓库地址
 support_platforms:
