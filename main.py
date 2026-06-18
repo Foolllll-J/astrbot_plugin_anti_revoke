@@ -18,7 +18,8 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.platform import MessageType
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
-from .rendering.chat_screenshot import generate_text_recall_screenshot
+from .rendering.chat_screenshot import generate_text_recall_screenshot, set_font_dir as set_screenshot_font_dir
+from .rendering.font_manager import FontManager
 
 
 def build_cache_task_key(group_id: str, message_id: str) -> str:
@@ -132,7 +133,7 @@ async def _download_and_cache_image(session: aiohttp.ClientSession, component: C
         return None
 
 async def _process_component_and_get_gocq_part(
-    comp, session: aiohttp.ClientSession, temp_path: Path, local_files_to_cleanup: List[str], local_file_map: Dict = None
+    comp, session: aiohttp.ClientSession, temp_path: Path, local_files_to_cleanup: List[str], local_file_map: Dict = None, use_real_at: bool = False
 ) -> List[Dict]:
     gocq_parts = []
     comp_type_name = getattr(comp.type, 'name', 'unknown')
@@ -143,10 +144,16 @@ async def _process_component_and_get_gocq_part(
         face_id = getattr(comp, 'id', None)
         if face_id is not None: gocq_parts.append({"type": "face", "data": {"id": int(face_id)}})
     elif comp_type_name == 'At':
-        qq = getattr(comp, 'qq', '未知QQ')
-        name = getattr(comp, 'name', f'@{{{qq}}}')
-        at_text = f"@{name}({qq})"
-        gocq_parts.append({"type": "text", "data": {"text": at_text}})
+        qq = getattr(comp, 'qq', None)
+        if qq:
+            if use_real_at:
+                # 伪造合并转发：使用真实的 At 组件
+                gocq_parts.append({"type": "at", "data": {"qq": str(qq)}})
+            else:
+                # 普通撤回通知：使用文本形式
+                name = getattr(comp, 'name', f'@{{{qq}}}')
+                at_text = f"@{name}({qq})"
+                gocq_parts.append({"type": "text", "data": {"text": at_text}})
     elif comp_type_name == 'Image':
         local_path = await _download_and_cache_image(session, comp, temp_path)
         if local_path:
@@ -230,22 +237,28 @@ class AntiRevoke(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         config = config or {}
-        self.monitor_groups = [str(g) for g in config.get("monitor_groups", []) or []]
-        self.target_receivers = [str(r) for r in config.get("target_receivers", []) or []]
-        self.target_groups = [str(g) for g in config.get("target_groups", []) or []]
-        self.ignore_senders = [str(s) for s in config.get("ignore_senders", []) or []]
-        self.ignore_operators = [str(o) for o in config.get("ignore_operators", []) or []]
         self.instance_id = "AntiRevoke"
-        self.cache_expiration_time = int(config.get("cache_expiration_time", 300))
+        monitor = config.get("monitor", {}) or {}
+        target = config.get("target", {}) or {}
+        cache = config.get("cache", {}) or {}
+        forward = config.get("forward", {}) or {}
+        enhance = config.get("enhance", {}) or {}
+        self.monitor_groups = [str(g) for g in monitor.get("monitor_groups", []) or []]
+        self.target_receivers = [str(r) for r in target.get("target_receivers", []) or []]
+        self.target_groups = [str(g) for g in target.get("target_groups", []) or []]
+        self.ignore_senders = [str(s) for s in monitor.get("ignore_senders", []) or []]
+        self.ignore_operators = [str(o) for o in monitor.get("ignore_operators", []) or []]
+        self.cache_expiration_time = int(cache.get("cache_expiration_time", 300))
         self.cache_pending_timeout = min(self.cache_expiration_time, 2)
         self.file_download_retry_attempts = 3
         self.file_download_retry_delay = 0.2
-        self.file_size_threshold_mb = int(config.get("file_size_threshold_mb", 300))
-        self.forward_relay_group = str(config.get("forward_relay_group", "") or "")
-        self.forward_to_self = config.get("forward_to_self", False)
-        self.auto_recall_relay = config.get("auto_recall_relay", True)
-        self.enable_text_screenshot = config.get("enable_text_screenshot", False)
-        self.show_title = config.get("show_title", True)
+        self.file_size_threshold_mb = int(cache.get("file_size_threshold_mb", 300))
+        self.forward_relay_group = str(forward.get("forward_relay_group", "") or "")
+        self.forward_to_self = forward.get("forward_to_self", False)
+        self.auto_recall_relay = forward.get("auto_recall_relay", True)
+        self.enable_text_screenshot = enhance.get("enable_text_screenshot", False)
+        self.show_title = enhance.get("show_title", True)
+        self.enable_fake_forward = enhance.get("enable_fake_forward", False)
         self.context = context
         self.temp_path = Path(StarTools.get_data_dir("astrbot_plugin_anti_revoke"))
         self.temp_path.mkdir(exist_ok=True)
@@ -255,10 +268,47 @@ class AntiRevoke(Star):
         self.voice_cache_path.mkdir(exist_ok=True)
         self.file_cache_path = self.temp_path / "files"
         self.file_cache_path.mkdir(exist_ok=True)
+
+        # 字体 CDN 下载初始化
+        self.font_cache_path = self.temp_path / "fonts"
+        if self.enable_text_screenshot:
+            self.font_cache_path.mkdir(parents=True, exist_ok=True)
+            set_screenshot_font_dir(self.font_cache_path)
+        self._font_manager = FontManager(self.temp_path) if self.enable_text_screenshot else None
+        self._font_task: asyncio.Task | None = None
+
         self._cache_tasks: dict[str, CacheTaskState] = {}
         self._cleanup_cache_on_startup()
         asyncio.create_task(self._cleanup_kv_data())
-    
+
+    async def initialize(self) -> None:
+        if self._font_manager is not None:
+            self._font_task = asyncio.create_task(
+                self._ensure_fonts(),
+                name="anti-revoke-字体下载",
+            )
+
+    async def terminate(self) -> None:
+        if self._font_task is not None and not self._font_task.done():
+            self._font_task.cancel()
+            try:
+                await self._font_task
+            except asyncio.CancelledError:
+                pass
+        self._font_task = None
+
+    async def _ensure_fonts(self) -> None:
+        try:
+            ok = await self._font_manager.ensure_fonts()
+            if ok:
+                set_screenshot_font_dir(self.font_cache_path)
+            else:
+                logger.warning(f"[{self.instance_id}] 字体下载未完成，将使用内置字体回退")
+        except Exception as e:
+            logger.error(f"[{self.instance_id}] 字体下载过程异常: {e}")
+        finally:
+            self._font_task = None
+
     async def _cleanup_kv_data(self):
         """清理 KV 存储中不再监控的群组配置"""
         kv_targets = await self.get_kv_data("forward_targets", {})
@@ -268,7 +318,7 @@ class AntiRevoke(Star):
         cleaned_targets = {}
         changed = False
         for group_id, targets in kv_targets.items():
-            if group_id in self.monitor_groups:
+            if self._is_monitored(group_id):
                 cleaned_targets[group_id] = targets
             else:
                 changed = True
@@ -331,10 +381,13 @@ class AntiRevoke(Star):
         except Exception as e:
             logger.error(f"[{self.instance_id}] 自动撤回中转群消息失败 (ID: {relay_msg_id}): {e}")
 
+    def _is_monitored(self, group_id: str) -> bool:
+        return not self.monitor_groups or group_id in self.monitor_groups
+
     def _should_skip_cache(self, group_id: str, sender_id: str, message_type) -> bool:
         return (
             message_type != MessageType.GROUP_MESSAGE
-            or group_id not in self.monitor_groups
+            or not self._is_monitored(group_id)
             or str(sender_id) in self.ignore_senders
         )
 
@@ -531,7 +584,7 @@ class AntiRevoke(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def add_forward(self, event: AstrMessageEvent, group_id: str, target: str):
         """设置撤回消息的转发目标。格式：撤回转发 群号 @私聊或#群聊"""
-        if group_id not in self.monitor_groups:
+        if not self._is_monitored(group_id):
             yield event.plain_result(f"❌ 群号 {group_id} 不在监控列表中，请先在配置中添加。")
             return
         
@@ -646,6 +699,7 @@ class AntiRevoke(Star):
                 show_title=self.show_title,
             )
             if not image_bytes:
+                logger.warning(f"[{self.instance_id}] 截图生成失败（返回空）")
                 return
 
             image_message = [
@@ -665,7 +719,7 @@ class AntiRevoke(Star):
                 "[聊天截图发送失败]",
             )
         except Exception as exc:
-            logger.error(f"[{self.instance_id}] failed to send text recall screenshot: {exc}")
+            logger.error(f"[{self.instance_id}] 发送截图异常: {exc}")
 
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=20)
@@ -1112,6 +1166,44 @@ class AntiRevoke(Star):
             await self._notify_send_failure(client, target_type, target_id_str, context, error, fallback_text)
             return False
 
+    async def _send_fake_forward(
+        self,
+        client,
+        target_type: str,
+        target_id_str: str,
+        sender_id: str,
+        member_nickname: str,
+        timestamp: int,
+        components: list,
+        local_file_map: dict,
+        local_files_to_cleanup: list,
+    ):
+        """基于缓存的组件列表构造伪造的合并转发消息（聊天记录样式）。"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                segments = []
+                for comp in components:
+                    parts = await _process_component_and_get_gocq_part(
+                        comp, session, self.temp_path, local_files_to_cleanup, local_file_map, use_real_at=True
+                    )
+                    segments.extend(parts)
+            if not segments:
+                return
+            node = {
+                "type": "node",
+                "data": {
+                    "name": member_nickname,
+                    "uin": int(sender_id),
+                    "time": int(timestamp or 0),
+                    "content": segments,
+                },
+            }
+            action = "send_private_forward_msg" if target_type == "private" else "send_group_forward_msg"
+            params = {"user_id": int(target_id_str)} if target_type == "private" else {"group_id": int(target_id_str)}
+            await client.api.call_action(action, messages=[node], **params)
+        except Exception as e:
+            logger.warning(f"[{self.instance_id}] 伪造合并转发发送失败 ({target_type}/{target_id_str}): {e}")
+
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
     async def handle_recall_event(self, event: AstrMessageEvent):
@@ -1123,7 +1215,7 @@ class AntiRevoke(Star):
             message_id = str(get_value(raw_message, "message_id"))
             operator_id = str(get_value(raw_message, "operator_id"))
             recall_sender_id = str(get_value(raw_message, "user_id"))
-            if group_id not in self.monitor_groups or not message_id: return None
+            if not self._is_monitored(group_id) or not message_id: return None
             if operator_id in self.ignore_operators:
                 logger.debug(f"[{self.instance_id}] 操作者 {operator_id} 在忽略列表中，跳过处理")
                 return None
@@ -1371,6 +1463,19 @@ class AntiRevoke(Star):
                                     final_parts_to_send,
                                     f"发送特殊内容 ({comp_type_name})",
                                     fallback_text,
+                                    )
+                            
+                            if self.enable_fake_forward:
+                                await self._send_fake_forward(
+                                    client,
+                                    target_type,
+                                    target_id_str,
+                                    sender_id,
+                                    member_nickname,
+                                    timestamp,
+                                    components,
+                                    local_file_map,
+                                    local_files_to_cleanup,
                                 )
                 
                 finally:

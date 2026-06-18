@@ -10,8 +10,14 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 RESOURCES_DIR = Path(__file__).parent.parent / "resources"
+FONT_DIR: Path | None = None
 FONT_PATH = RESOURCES_DIR / "fonts" / "NotoSansSC-Regular.ttf"
 FONT_BOLD_PATH = RESOURCES_DIR / "fonts" / "NotoSansSC-Bold.ttf"
+
+
+def set_font_dir(path: Path) -> None:
+    global FONT_DIR
+    FONT_DIR = path
 
 EMOJI_PATTERN = re.compile(
     "["
@@ -25,7 +31,7 @@ EMOJI_PATTERN = re.compile(
     "\U0001F900-\U0001F9FF"
     "\U0001FA00-\U0001FAFF"
     "\U00002702-\U000027B0"
-    "\U000024C2-\U0001F251"
+    "\U000024C2-\U000024FF"
     "\U00002600-\U000026FF"
     "]+",
     flags=re.UNICODE,
@@ -71,19 +77,28 @@ def _get_pilmoji_class():
         if _PILMOJI_CLASS is None:
             raise AttributeError("pilmoji.Pilmoji not found")
         _PILMOJI_STATUS = "available"
-        logger.info("[AntiRevoke] emoji rendering enabled via pilmoji")
         return _PILMOJI_CLASS
     except Exception as exc:
         _PILMOJI_STATUS = "unavailable"
         _PILMOJI_CLASS = None
         logger.warning(
-            "[AntiRevoke] emoji rendering unavailable, fallback to emoji filtering: %s",
+            "[AntiRevoke] emoji 渲染不可用，回退至 emoji 过滤: %s",
             exc,
         )
         return None
 
 
 def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+    # 优先级 1: CDN 下载的字体
+    if FONT_DIR is not None:
+        cdn_path = FONT_DIR / ("NotoSansSC-Bold.ttf" if bold else "NotoSansSC-Regular.ttf")
+        if cdn_path.exists():
+            try:
+                return ImageFont.truetype(str(cdn_path), size)
+            except Exception:
+                pass
+
+    # 优先级 2: 插件内置字体（旧版兼容）
     target_font_path = FONT_BOLD_PATH if bold else FONT_PATH
     if target_font_path.exists():
         try:
@@ -91,12 +106,14 @@ def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
         except Exception:
             pass
 
+    # 优先级 3: 相反字重回退
     fallback_font_path = FONT_PATH if bold else FONT_BOLD_PATH
     if fallback_font_path.exists():
         try:
             return ImageFont.truetype(str(fallback_font_path), size)
         except Exception:
             pass
+
     return ImageFont.load_default()
 
 
@@ -378,7 +395,7 @@ async def get_avatar(user_id: str) -> bytes | None:
                 resp.raise_for_status()
                 return await resp.read()
     except Exception as exc:
-        logger.error(f"[AntiRevoke] failed to download avatar: {exc}")
+        logger.error(f"[AntiRevoke] 获取头像失败: {exc}")
         return None
 
 
@@ -401,7 +418,7 @@ async def get_member_rich_info(client, group_id: int, user_id: int, fallback_nam
                 no_cache=True,
             )
         except Exception as exc:
-            logger.warning(f"[AntiRevoke] failed to get group member info: {exc}")
+            logger.warning(f"[AntiRevoke] 获取群成员信息失败: {exc}")
             info = None
 
     info = info or {}
@@ -424,10 +441,12 @@ async def generate_text_recall_screenshot(
     preserve_emoji = _get_pilmoji_class() is not None
     text = sanitize_display_text(text, preserve_emoji=preserve_emoji)
     if not text:
+        logger.warning("[AntiRevoke] 截图: 文本净化后为空")
         return None
 
     avatar = await get_avatar(str(user_id))
     if not avatar:
+        logger.warning(f"[AntiRevoke] 截图: 获取头像失败 (user_id={user_id})")
         return None
 
     info = await get_member_rich_info(client, group_id, user_id, fallback_name=fallback_name)
@@ -442,5 +461,5 @@ async def generate_text_recall_screenshot(
             show_title=show_title,
         )
     except Exception as exc:
-        logger.exception(f"[AntiRevoke] failed to render text recall screenshot: {exc}")
+        logger.exception(f"[AntiRevoke] 渲染文本撤回截图失败: {exc}")
         return None

@@ -1,74 +1,115 @@
 {
-  "monitor_groups": {
-    "type": "list",
-    "description": "监控群聊列表",
-    "hint": "仅处理这些群内的撤回事件。",
-    "default": []
+  "monitor": {
+    "description": "监控范围",
+    "hint": "配置需要监控哪些群聊以及忽略哪些用户。",
+    "type": "object",
+    "items": {
+      "monitor_groups": {
+        "type": "list",
+        "description": "监控群聊列表",
+        "hint": "留空表示监控全部群聊。填入群号则仅处理这些群内的撤回事件。",
+        "default": []
+      },
+      "ignore_senders": {
+        "type": "list",
+        "description": "忽略发送者列表",
+        "hint": "来自列表中的 QQ 用户的消息不会被处理。",
+        "default": []
+      },
+      "ignore_operators": {
+        "type": "list",
+        "description": "忽略操作者列表",
+        "hint": "由列表中的用户执行的撤回不会触发通知。",
+        "default": []
+      }
+    }
   },
-  "target_receivers": {
-    "type": "list",
-    "description": "私聊通知对象",
-    "hint": "发送撤回通知的 QQ 私聊目标。",
-    "default": []
+  "target": {
+    "description": "通知目标",
+    "hint": "撤回恢复消息要发送到哪些会话。",
+    "type": "object",
+    "items": {
+      "target_receivers": {
+        "type": "list",
+        "description": "私聊通知对象",
+        "hint": "发送撤回通知的 QQ 私聊目标。",
+        "default": []
+      },
+      "target_groups": {
+        "type": "list",
+        "description": "群聊通知对象",
+        "hint": "发送撤回通知的 QQ 群聊目标。",
+        "default": []
+      }
+    }
   },
-  "target_groups": {
-    "type": "list",
-    "description": "群聊通知对象",
-    "hint": "发送撤回通知的 QQ 群聊目标。",
-    "default": []
+  "cache": {
+    "description": "缓存与限制",
+    "hint": "消息缓存时长、媒体文件大小阈值。",
+    "type": "object",
+    "items": {
+      "cache_expiration_time": {
+        "type": "int",
+        "description": "缓存保留时长（秒）",
+        "hint": "消息缓存和临时文件的过期时间，默认 300 秒。",
+        "default": 300
+      },
+      "file_size_threshold_mb": {
+        "type": "int",
+        "description": "媒体大小阈值（MB）",
+        "hint": "超过阈值的视频/文件不缓存；设为 0 表示不限制。",
+        "default": 50
+      }
+    }
   },
-  "ignore_senders": {
-    "type": "list",
-    "description": "忽略发送者列表",
-    "hint": "来自列表中的 QQ 用户的消息不会被处理。",
-    "default": []
+  "forward": {
+    "description": "合并转发恢复",
+    "hint": "针对合并转发类型消息的缓存和中转设置。",
+    "type": "object",
+    "items": {
+      "forward_to_self": {
+        "type": "bool",
+        "description": "合并转发消息转发 Bot 自身",
+        "hint": "开启后，收到合并转发消息时会先转发到机器人私聊用于后续取回。",
+        "default": false
+      },
+      "forward_relay_group": {
+        "type": "string",
+        "description": "合并转发中转群号",
+        "hint": "填写后会把合并转发消息先转发到该群，撤回时再转发到通知对象。",
+        "default": ""
+      },
+      "auto_recall_relay": {
+        "type": "bool",
+        "description": "自动撤回中转消息",
+        "hint": "缓存到期后自动撤回发送至中转群的中转消息。",
+        "default": true
+      }
+    }
   },
-  "ignore_operators": {
-    "type": "list",
-    "description": "忽略操作者列表",
-    "hint": "由列表中的用户执行的撤回不会触发通知。",
-    "default": []
-  },
-  "cache_expiration_time": {
-    "type": "int",
-    "description": "缓存保留时长（秒）",
-    "hint": "消息缓存和临时文件的过期时间，默认 300 秒。",
-    "default": 300
-  },
-  "enable_text_screenshot": {
-    "type": "bool",
-    "description": "文本撤回附带聊天截图",
-    "hint": "开启后，纯文本类撤回会额外发送一张仿 QQ 聊天截图。",
-    "default": false
-  },
-  "show_title": {
-    "type": "bool",
-    "description": "显示头衔徽标",
-    "hint": "生成的聊天截图是否显示群头衔/等级徽标。",
-    "default": true
-  },
-  "file_size_threshold_mb": {
-    "type": "int",
-    "description": "媒体大小阈值（MB）",
-    "hint": "超过阈值的视频/文件不缓存；设为 0 表示不限制。",
-    "default": 300
-  },
-  "forward_to_self": {
-    "type": "bool",
-    "description": "合并转发消息转发 Bot 自身",
-    "hint": "开启后，收到合并转发消息时会先转发到机器人私聊用于后续取回。",
-    "default": false
-  },
-  "forward_relay_group": {
-    "type": "string",
-    "description": "合并转发中转群号",
-    "hint": "填写后会把合并转发消息先转发到该群，撤回时再转发到通知对象。",
-    "default": ""
-  },
-  "auto_recall_relay": {
-    "type": "bool",
-    "description": "自动撤回中转消息",
-    "hint": "缓存到期后自动撤回发送至中转群的中转消息。",
-    "default": true
+  "enhance": {
+    "description": "增强恢复",
+    "hint": "启用额外的恢复形式：伪造合并转发、聊天截图等。",
+    "type": "object",
+    "items": {
+      "enable_fake_forward": {
+        "type": "bool",
+        "description": "撤回消息伪造为合并转发",
+        "hint": "开启后，撤回恢复会额外发送一条合并转发，内部为伪造出的撤回消息。",
+        "default": false
+      },
+      "enable_text_screenshot": {
+        "type": "bool",
+        "description": "文本撤回附带聊天截图",
+        "hint": "开启后，纯文本类撤回会额外发送一张仿 QQ 聊天截图。",
+        "default": false
+      },
+      "show_title": {
+        "type": "bool",
+        "description": "显示头衔徽标",
+        "hint": "生成的聊天截图是否显示群头衔/等级徽标。",
+        "default": true
+      }
+    }
   }
 }
