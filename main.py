@@ -110,12 +110,41 @@ def _deserialize_components(comp_dicts: List[Dict]) -> List:
     return components
 
 
+def _build_original_image_urls(raw_message: dict) -> list[str | None]:
+    """从 raw_message 中提取 Image 段的原始 HTTP URL 列表，顺序与消息段一致。"""
+    urls = []
+    if isinstance(raw_message, dict):
+        msg_list = raw_message.get('message', [])
+        if isinstance(msg_list, list):
+            for seg in msg_list:
+                if isinstance(seg, dict) and seg.get('type') == 'image':
+                    data = seg.get('data', {}) or {}
+                    url = data.get('url', '') or ''
+                    urls.append(url if url.startswith(('http://', 'https://')) else None)
+    return urls
+
+
 async def _download_and_cache_image(session: aiohttp.ClientSession, component: Comp.Image, temp_path: Path) -> str:
     image_url = getattr(component, 'url', None)
     if not image_url: return None
-    file_extension = '.jpg'
-    if image_url.lower().endswith('.png'): file_extension = '.png'
-    file_name = f"forward_{int(time.time() * 1000)}{file_extension}"
+
+    # 本地路径直接复制，兼容 AstrBot 预处理阶段已将 url 改写为本地缓存路径的场景
+    if not image_url.startswith(('http://', 'https://')):
+        src = Path(image_url)
+        if src.exists():
+            file_name = f"forward_{int(time.time() * 1000)}{src.suffix or '.jpg'}"
+            dest = temp_path / file_name
+            try:
+                shutil.copy2(str(src), str(dest))
+                return str(dest.absolute())
+            except Exception as e:
+                logger.error(f"[AntiRevoke] ❌ 图片复制失败 ({image_url}): {e}")
+                return None
+        else:
+            logger.warning(f"[AntiRevoke] 图片路径不存在: {image_url}")
+            return None
+
+    file_name = f"forward_{int(time.time() * 1000)}{Path(image_url).suffix or '.jpg'}"
     temp_file_path = temp_path / file_name
     try:
         headers = {'User-Agent': 'Mozilla/5.0 ...', 'Referer': 'https://qzone.qq.com/'}
@@ -133,7 +162,7 @@ async def _download_and_cache_image(session: aiohttp.ClientSession, component: C
         return None
 
 async def _process_component_and_get_gocq_part(
-    comp, session: aiohttp.ClientSession, temp_path: Path, local_files_to_cleanup: List[str], local_file_map: Dict = None, use_real_at: bool = False
+    comp, session: aiohttp.ClientSession, temp_path: Path, local_files_to_cleanup: List[str], local_file_map: Dict = None, show_qq_in_at: bool = False
 ) -> List[Dict]:
     gocq_parts = []
     comp_type_name = getattr(comp.type, 'name', 'unknown')
@@ -146,14 +175,11 @@ async def _process_component_and_get_gocq_part(
     elif comp_type_name == 'At':
         qq = getattr(comp, 'qq', None)
         if qq:
-            if use_real_at:
-                # 伪造合并转发：使用真实的 At 组件
-                gocq_parts.append({"type": "at", "data": {"qq": str(qq)}})
+            name = getattr(comp, 'name', f'@{qq}')
+            if show_qq_in_at:
+                gocq_parts.append({"type": "text", "data": {"text": f"@{name}({qq}) "}})
             else:
-                # 普通撤回通知：使用文本形式
-                name = getattr(comp, 'name', f'@{{{qq}}}')
-                at_text = f"@{name}({qq})"
-                gocq_parts.append({"type": "text", "data": {"text": at_text}})
+                gocq_parts.append({"type": "text", "data": {"text": f"@{name} "}})
     elif comp_type_name == 'Image':
         local_path = await _download_and_cache_image(session, comp, temp_path)
         if local_path:
@@ -946,7 +972,9 @@ class AntiRevoke(Star):
             logger.warning(f'[AntiRevoke] 解析 raw_message 失败: {exc}')
 
         local_file_map = {}
-        has_downloadable_content = any(getattr(comp.type, 'name', '') in ['Video', 'Record', 'File'] for comp in components)
+        original_image_urls = _build_original_image_urls(raw_message)
+        original_image_idx = -1
+        has_downloadable_content = any(getattr(comp.type, 'name', '') in ['Image', 'Video', 'Record', 'File'] for comp in components)
         if has_downloadable_content:
             for comp in components:
                 comp_type_name = getattr(comp.type, 'name', 'unknown')
@@ -1073,6 +1101,61 @@ class AntiRevoke(Star):
                     except Exception as exc:
                         logger.error(f'[{self.instance_id}] ❌ 处理 File 缓存时发生错误: {exc}\n{traceback.format_exc()}')
 
+                elif comp_type_name == 'Image':
+                    image_url = getattr(comp, 'url', None)
+                    if not image_url:
+                        continue
+
+                    original_image_idx += 1
+                    orig_url = original_image_urls[original_image_idx] if original_image_idx < len(original_image_urls) else None
+
+                    if orig_url:
+                        try:
+                            dest_name = f"image_{int(time.time() * 1000)}{Path(orig_url).suffix or '.jpg'}"
+                            dest = self.temp_path / dest_name
+                            headers = {'User-Agent': 'Mozilla/5.0 ...', 'Referer': 'https://qzone.qq.com/'}
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(orig_url, headers=headers, timeout=15) as response:
+                                    response.raise_for_status()
+                                    image_bytes = await response.read()
+                                    with open(dest, 'wb') as f:
+                                        f.write(image_bytes)
+                            setattr(comp, 'url', str(dest.absolute()))
+                            asyncio.create_task(delayed_delete(self.cache_expiration_time, dest))
+                            continue
+                        except Exception as exc:
+                            logger.warning(f'[{self.instance_id}] 原始URL下载失败，使用当前URL: {exc}')
+
+                    if not image_url.startswith(('http://', 'https://')):
+                        src = Path(image_url)
+                        if src.exists():
+                            suffix = src.suffix or '.jpg'
+                            dest_name = f"image_{int(time.time() * 1000)}{suffix}"
+                            dest = self.temp_path / dest_name
+                            try:
+                                shutil.copy2(str(src), str(dest))
+                                setattr(comp, 'url', str(dest.absolute()))
+                                asyncio.create_task(delayed_delete(self.cache_expiration_time, dest))
+                            except Exception as exc:
+                                logger.error(f'[{self.instance_id}] ❌ 图片缓存复制失败 ({image_url}): {exc}')
+                        else:
+                            logger.warning(f'[{self.instance_id}] 图片路径不存在，跳过缓存: {image_url}')
+                    else:
+                        try:
+                            dest_name = f"image_{int(time.time() * 1000)}{Path(image_url).suffix or '.jpg'}"
+                            dest = self.temp_path / dest_name
+                            headers = {'User-Agent': 'Mozilla/5.0 ...', 'Referer': 'https://qzone.qq.com/'}
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(image_url, headers=headers, timeout=15) as response:
+                                    response.raise_for_status()
+                                    image_bytes = await response.read()
+                                    with open(dest, 'wb') as f:
+                                        f.write(image_bytes)
+                            setattr(comp, 'url', str(dest.absolute()))
+                            asyncio.create_task(delayed_delete(self.cache_expiration_time, dest))
+                        except Exception as exc:
+                            logger.error(f'[{self.instance_id}] ❌ 图片缓存下载失败 ({image_url}): {exc}')
+
         file_path = cache_file if isinstance(cache_file, Path) else self._get_cache_file_path(group_id, message_id)
         self._write_cache_record(
             file_path,
@@ -1184,7 +1267,7 @@ class AntiRevoke(Star):
                 segments = []
                 for comp in components:
                     parts = await _process_component_and_get_gocq_part(
-                        comp, session, self.temp_path, local_files_to_cleanup, local_file_map, use_real_at=True
+                        comp, session, self.temp_path, local_files_to_cleanup, local_file_map
                     )
                     segments.extend(parts)
             if not segments:
@@ -1374,7 +1457,7 @@ class AntiRevoke(Star):
                             if not special_components:
                                 message_parts = []
                                 for comp in other_components:
-                                    converted_parts = await _process_component_and_get_gocq_part(comp, session, self.temp_path, local_files_to_cleanup, local_file_map)
+                                    converted_parts = await _process_component_and_get_gocq_part(comp, session, self.temp_path, local_files_to_cleanup, local_file_map, show_qq_in_at=True)
                                     message_parts.extend(converted_parts)
                                 
                                 has_inserted_prefix, final_message_parts = False, []
@@ -1423,7 +1506,7 @@ class AntiRevoke(Star):
                                 if other_components:
                                     message_parts = []
                                     for comp in other_components:
-                                        converted_parts = await _process_component_and_get_gocq_part(comp, session, self.temp_path, local_files_to_cleanup, local_file_map)
+                                        converted_parts = await _process_component_and_get_gocq_part(comp, session, self.temp_path, local_files_to_cleanup, local_file_map, show_qq_in_at=True)
                                         message_parts.extend(converted_parts)
                                     if message_parts:
                                         content_message = [{"type": "text", "data": {"text": f"{member_nickname}："}}]
@@ -1442,7 +1525,7 @@ class AntiRevoke(Star):
                             for comp in special_components:
                                 await asyncio.sleep(0.5)
                                 comp_type_name = getattr(comp.type, 'name', 'unknown')
-                                content_parts = await _process_component_and_get_gocq_part(comp, session, self.temp_path, local_files_to_cleanup, local_file_map)
+                                content_parts = await _process_component_and_get_gocq_part(comp, session, self.temp_path, local_files_to_cleanup, local_file_map, show_qq_in_at=True)
                                 final_parts_to_send = content_parts
                                 if not other_components:
                                     prefix_part = [{"type": "text", "data": {"text": f"{member_nickname}："}}]
