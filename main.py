@@ -46,7 +46,8 @@ async def delayed_delete(delay: int, path: Path):
         logger.error(f"[AntiRevoke] 删除文件失败 ({path}): {traceback.format_exc()}")
 
 async def _cleanup_local_files(file_paths: List[str]):
-    if not file_paths: return
+    if not file_paths:
+        return
     await asyncio.sleep(1)
     for abs_path in file_paths:
         try:
@@ -70,7 +71,7 @@ def _serialize_components(components: list) -> List[Dict]:
             comp_type_name = getattr(comp.type, 'name', 'unknown')
             comp_dict['type'] = comp_type_name
             serialized_list.append(comp_dict)
-        except:
+        except Exception:
             serialized_list.append({"type": "Unknown", "data": f"<{str(comp)}>"})
     return serialized_list
 
@@ -92,7 +93,7 @@ def _deserialize_components(comp_dicts: List[Dict]) -> List:
         comp_type_name = data_to_construct.pop('type', None)
 
         if not comp_type_name:
-            logger.warning(f"[AntiRevoke] 反序列化时遇到缺少类型的组件字典，已跳过。")
+            logger.warning("[AntiRevoke] 反序列化时遇到缺少类型的组件字典，已跳过。")
             continue
         
         cls = COMPONENT_MAP.get(comp_type_name)
@@ -126,7 +127,8 @@ def _build_original_image_urls(raw_message: dict) -> list[str | None]:
 
 async def _download_and_cache_image(session: aiohttp.ClientSession, component: Comp.Image, temp_path: Path) -> str:
     image_url = getattr(component, 'url', None)
-    if not image_url: return None
+    if not image_url:
+        return None
 
     # 本地路径直接复制，兼容 AstrBot 预处理阶段已将 url 改写为本地缓存路径的场景
     if not image_url.startswith(('http://', 'https://')):
@@ -152,13 +154,16 @@ async def _download_and_cache_image(session: aiohttp.ClientSession, component: C
             response.raise_for_status()
             content_type = response.headers.get('Content-Type', '').lower()
             if 'image' not in content_type and 'octet-stream' not in content_type:
-                logger.warning(f"[AntiRevoke] 下载 URL 返回类型非图片: {content_type}"); return None
+                logger.warning(f"[AntiRevoke] 下载 URL 返回类型非图片: {content_type}")
+                return None
             image_bytes = await response.read()
-            with open(temp_file_path, 'wb') as f: f.write(image_bytes)
+            with open(temp_file_path, 'wb') as f:
+                f.write(image_bytes)
         return str(temp_file_path.absolute())
     except Exception as e:
         logger.error(f"[AntiRevoke] ❌ 图片下载或保存失败 ({image_url}): {e}")
-        if temp_file_path.exists(): os.remove(temp_file_path)
+        if temp_file_path.exists():
+            os.remove(temp_file_path)
         return None
 
 async def _process_component_and_get_gocq_part(
@@ -168,10 +173,12 @@ async def _process_component_and_get_gocq_part(
     comp_type_name = getattr(comp.type, 'name', 'unknown')
     if comp_type_name in ['Plain', 'Text']:
         text = getattr(comp, 'text', '')
-        if text: gocq_parts.append({"type": "text", "data": {"text": text}})
+        if text:
+            gocq_parts.append({"type": "text", "data": {"text": text}})
     elif comp_type_name == 'Face':
         face_id = getattr(comp, 'id', None)
-        if face_id is not None: gocq_parts.append({"type": "face", "data": {"id": int(face_id)}})
+        if face_id is not None:
+            gocq_parts.append({"type": "face", "data": {"id": int(face_id)}})
     elif comp_type_name == 'At':
         qq = getattr(comp, 'qq', None)
         if qq:
@@ -203,7 +210,7 @@ async def _process_component_and_get_gocq_part(
             gocq_parts.append({"type": "video", "data": {"file": f"file:///{absolute_path}"}})
         else:
             logger.error(f"[AntiRevoke] ❌ 准备发送视频时失败：缓存的视频文件已丢失，路径: {cached_video_path_str}")
-            gocq_parts.append({"type": "text", "data": {"text": f"[错误：撤回的视频文件已丢失]"}})
+            gocq_parts.append({"type": "text", "data": {"text": "[错误：撤回的视频文件已丢失]"}})
     elif comp_type_name == 'Record':
         cached_voice_path_str = getattr(comp, 'file', None)
         if cached_voice_path_str and Path(cached_voice_path_str).exists():
@@ -218,7 +225,7 @@ async def _process_component_and_get_gocq_part(
                 gocq_parts.append({"type": "record", "data": {"file": f"file:///{absolute_path}"}})
         else:
             logger.error(f"[AntiRevoke] ❌ 准备发送语音时失败：缓存的语音文件已丢失，路径: {cached_voice_path_str}")
-            gocq_parts.append({"type": "text", "data": {"text": f"[错误：撤回的语音文件已丢失]"}})
+            gocq_parts.append({"type": "text", "data": {"text": "[错误：撤回的语音文件已丢失]"}})
     elif comp_type_name == 'File':
         unique_key = getattr(comp, 'url', None)
         cached_file_path_str = local_file_map.get(unique_key) if local_file_map and unique_key else None
@@ -322,6 +329,7 @@ class AntiRevoke(Star):
             except asyncio.CancelledError:
                 pass
         self._font_task = None
+        logger.info(f"[{self.instance_id}] 插件已卸载/重载。")
 
     async def _ensure_fonts(self) -> None:
         try:
@@ -390,7 +398,8 @@ class AntiRevoke(Star):
         expired_count = 0
         for cache_dir in [self.video_cache_path, self.voice_cache_path, self.file_cache_path, self.temp_path]:
              for file in cache_dir.glob("*"):
-                 if file.is_dir(): continue
+                 if file.is_dir():
+                     continue
                  try:
                      if now - file.stat().st_mtime > self.cache_expiration_time:
                          file.unlink(missing_ok=True)
@@ -603,9 +612,6 @@ class AntiRevoke(Star):
         logger.warning(f"[{self.instance_id}] 长轮询超时（ID: {message_id}, 上限: {self.cache_expiration_time}s, 耗时: {elapsed:.2f}s）")
         return None
 
-    async def terminate(self):
-        logger.info(f"[{self.instance_id}] 插件已卸载/重载。")
-        
     @filter.command("撤回转发")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def add_forward(self, event: AstrMessageEvent, group_id: str, target: str):
@@ -975,6 +981,8 @@ class AntiRevoke(Star):
         original_image_urls = _build_original_image_urls(raw_message)
         original_image_idx = -1
         has_downloadable_content = any(getattr(comp.type, 'name', '') in ['Image', 'Video', 'Record', 'File'] for comp in components)
+        image_cache: dict[str, str] = {}
+        file_cache: dict[str, str] = {}
         if has_downloadable_content:
             for comp in components:
                 comp_type_name = getattr(comp.type, 'name', 'unknown')
@@ -988,14 +996,14 @@ class AntiRevoke(Star):
                     if video_size and self.file_size_threshold_mb > 0:
                         video_size_mb = video_size / (1024 * 1024)
                         if video_size_mb > self.file_size_threshold_mb:
-                            setattr(comp, 'file', f'[视频过大未缓存: {video_size_mb:.2f} MB]')
+                            file_cache[file_id] = f'[视频过大未缓存: {video_size_mb:.2f} MB]'
                             continue
 
                     try:
                         ret = await client.api.call_action('get_file', **{'file_id': file_id})
                         download_url = ret.get('url')
                         if not download_url:
-                            setattr(comp, 'file', 'Error: API did not return a URL.')
+                            file_cache[file_id] = 'Error: API did not return a URL.'
                             continue
 
                         file_size_from_api = ret.get('file_size')
@@ -1004,7 +1012,7 @@ class AntiRevoke(Star):
                                 file_size_int = int(file_size_from_api) if isinstance(file_size_from_api, str) else file_size_from_api
                                 api_size_mb = file_size_int / (1024 * 1024)
                                 if api_size_mb > self.file_size_threshold_mb:
-                                    setattr(comp, 'file', f'[视频过大未缓存: {api_size_mb:.2f} MB]')
+                                    file_cache[file_id] = f'[视频过大未缓存: {api_size_mb:.2f} MB]'
                                     continue
                             except (ValueError, TypeError):
                                 logger.warning(f'[{self.instance_id}] 无法解析API返回的文件大小: {file_size_from_api}')
@@ -1015,13 +1023,13 @@ class AntiRevoke(Star):
 
                         dest_path = self.video_cache_path / f'{timestamp_ms}_{original_filename}'
                         if await self._download_video_from_url(download_url, dest_path):
-                            setattr(comp, 'file', str(dest_path.absolute()))
+                            file_cache[file_id] = str(dest_path.absolute())
                             asyncio.create_task(delayed_delete(self.cache_expiration_time, dest_path))
                         else:
-                            setattr(comp, 'file', f'Error: Download failed from {download_url}')
+                            file_cache[file_id] = f'Error: Download failed from {download_url}'
                     except Exception as exc:
                         logger.error(f'[{self.instance_id}] ❌ 处理视频缓存时发生错误: {exc}\n{traceback.format_exc()}')
-                        setattr(comp, 'file', 'Error: Exception during cache process.')
+                        file_cache[file_id] = 'Error: Exception during cache process.'
 
                 elif comp_type_name == 'Record':
                     file_id = getattr(comp, 'file', None)
@@ -1044,7 +1052,7 @@ class AntiRevoke(Star):
                                         with open(permanent_path, 'wb') as f:
                                             f.write(voice_bytes)
                                 os.chmod(permanent_path, 0o644)
-                                setattr(comp, 'file', str(permanent_path.absolute()))
+                                file_cache[file_id] = str(permanent_path.absolute())
                                 asyncio.create_task(delayed_delete(self.cache_expiration_time, permanent_path))
                                 continue
                             except Exception as exc:
@@ -1053,18 +1061,18 @@ class AntiRevoke(Star):
                         ret = await client.api.call_action('get_file', **{'file_id': file_id})
                         local_path = ret.get('file')
                         if not local_path or not os.path.exists(local_path):
-                            setattr(comp, 'file', 'Error: API did not return a valid file path.')
+                            file_cache[file_id] = 'Error: API did not return a valid file path.'
                             continue
 
                         original_suffix = Path(local_path).suffix or '.amr'
                         permanent_path = self.voice_cache_path / f'{timestamp_ms}{original_suffix}'
                         shutil.copy(local_path, permanent_path)
                         os.chmod(permanent_path, 0o644)
-                        setattr(comp, 'file', str(permanent_path.absolute()))
+                        file_cache[file_id] = str(permanent_path.absolute())
                         asyncio.create_task(delayed_delete(self.cache_expiration_time, permanent_path))
                     except Exception as exc:
                         logger.error(f'[{self.instance_id}] ❌ 处理 Record 缓存时发生错误: {exc}\n{traceback.format_exc()}')
-                        setattr(comp, 'file', 'Error: Exception during cache process.')
+                        file_cache[file_id] = 'Error: Exception during cache process.'
 
                 elif comp_type_name == 'File':
                     try:
@@ -1108,6 +1116,7 @@ class AntiRevoke(Star):
 
                     original_image_idx += 1
                     orig_url = original_image_urls[original_image_idx] if original_image_idx < len(original_image_urls) else None
+                    original_url = image_url
 
                     if orig_url:
                         try:
@@ -1120,7 +1129,7 @@ class AntiRevoke(Star):
                                     image_bytes = await response.read()
                                     with open(dest, 'wb') as f:
                                         f.write(image_bytes)
-                            setattr(comp, 'url', str(dest.absolute()))
+                            image_cache[original_url] = str(dest.absolute())
                             asyncio.create_task(delayed_delete(self.cache_expiration_time, dest))
                             continue
                         except Exception as exc:
@@ -1134,7 +1143,7 @@ class AntiRevoke(Star):
                             dest = self.temp_path / dest_name
                             try:
                                 shutil.copy2(str(src), str(dest))
-                                setattr(comp, 'url', str(dest.absolute()))
+                                image_cache[original_url] = str(dest.absolute())
                                 asyncio.create_task(delayed_delete(self.cache_expiration_time, dest))
                             except Exception as exc:
                                 logger.error(f'[{self.instance_id}] ❌ 图片缓存复制失败 ({image_url}): {exc}')
@@ -1151,12 +1160,23 @@ class AntiRevoke(Star):
                                     image_bytes = await response.read()
                                     with open(dest, 'wb') as f:
                                         f.write(image_bytes)
-                            setattr(comp, 'url', str(dest.absolute()))
+                            image_cache[original_url] = str(dest.absolute())
                             asyncio.create_task(delayed_delete(self.cache_expiration_time, dest))
                         except Exception as exc:
                             logger.error(f'[{self.instance_id}] ❌ 图片缓存下载失败 ({image_url}): {exc}')
 
         file_path = cache_file if isinstance(cache_file, Path) else self._get_cache_file_path(group_id, message_id)
+        serialized_components = _serialize_components(components)
+        for comp_dict in serialized_components:
+            ctype = comp_dict.get('type')
+            if ctype == 'Image':
+                url = comp_dict.get('url')
+                if url in image_cache:
+                    comp_dict['url'] = image_cache[url]
+            elif ctype in ('Video', 'Record'):
+                file_val = comp_dict.get('file')
+                if file_val in file_cache:
+                    comp_dict['file'] = file_cache[file_val]
         self._write_cache_record(
             file_path,
             {
@@ -1165,7 +1185,7 @@ class AntiRevoke(Star):
                 "message_id": message_id,
                 "sender_id": sender_id,
                 "timestamp": timestamp,
-                "components": _serialize_components(components),
+                "components": serialized_components,
                 "local_file_map": local_file_map,
                 "relay_info": relay_info,
             },
@@ -1298,7 +1318,8 @@ class AntiRevoke(Star):
             message_id = str(get_value(raw_message, "message_id"))
             operator_id = str(get_value(raw_message, "operator_id"))
             recall_sender_id = str(get_value(raw_message, "user_id"))
-            if not self._is_monitored(group_id) or not message_id: return None
+            if not self._is_monitored(group_id) or not message_id:
+                return None
             if operator_id in self.ignore_operators:
                 logger.debug(f"[{self.instance_id}] 操作者 {operator_id} 在忽略列表中，跳过处理")
                 return None
@@ -1465,7 +1486,9 @@ class AntiRevoke(Star):
                                     if not has_inserted_prefix and (part['type'] in ['text', 'image', 'face']):
                                         final_message_parts.append({"type": "text", "data": {"text": f"{member_nickname}："}})
                                         has_inserted_prefix = True
-                                        if part['type'] == 'text': final_message_parts[-1]['data']['text'] += part['data']['text']; continue
+                                        if part['type'] == 'text':
+                                            final_message_parts[-1]['data']['text'] += part['data']['text']
+                                            continue
                                     final_message_parts.append(part)
                                 
                                 final_prefix_text = f"{notification_prefix}{warning_text}\n--------------------\n"
@@ -1562,7 +1585,8 @@ class AntiRevoke(Star):
                                 )
                 
                 finally:
-                    if local_files_to_cleanup: asyncio.create_task(_cleanup_local_files(local_files_to_cleanup))
+                    if local_files_to_cleanup:
+                        asyncio.create_task(_cleanup_local_files(local_files_to_cleanup))
                     if file_path:
                         asyncio.create_task(delayed_delete(0, file_path))
             else:
