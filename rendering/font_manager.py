@@ -67,7 +67,9 @@ class FontManager:
         manifest = json.loads(payload.decode("utf-8"))
         return self.validate_manifest(manifest)
 
-    def is_update_required(self, remote_manifest: dict, local_manifest: dict | None) -> bool:
+    def is_update_required(
+        self, remote_manifest: dict, local_manifest: dict | None
+    ) -> bool:
         if not local_manifest:
             return True
         local_fonts = {f["name"]: f for f in local_manifest.get("fonts", [])}
@@ -97,12 +99,16 @@ class FontManager:
         except Exception as e:
             logger.warning(f"[AntiRevoke] 清理临时文件失败: {path}, {e}")
 
-    def download_font(self, url: str, dest_path: str, expected_sha256: str, expected_size: int) -> None:
+    def download_font(
+        self, url: str, dest_path: str, expected_sha256: str, expected_size: int
+    ) -> None:
         # 本地文件已存在且 SHA256 匹配则跳过
         if os.path.exists(dest_path):
             try:
                 if self.sha256_file(dest_path) == expected_sha256.lower():
-                    logger.debug(f"[AntiRevoke] 字体已存在且校验通过，跳过下载: {dest_path}")
+                    logger.debug(
+                        f"[AntiRevoke] 字体已存在且校验通过，跳过下载: {dest_path}"
+                    )
                     return
             except Exception:
                 pass
@@ -115,8 +121,10 @@ class FontManager:
                 url,
                 headers={"User-Agent": "astrbot-plugin-anti-revoke/1.0"},
             )
-            with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response, \
-                 open(tmp_path, "wb") as f:
+            with (
+                urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response,
+                open(tmp_path, "wb") as f,
+            ):
                 while True:
                     chunk = response.read(HASH_CHUNK_SIZE)
                     if not chunk:
@@ -125,7 +133,9 @@ class FontManager:
 
             actual_size = os.path.getsize(tmp_path)
             if actual_size != expected_size:
-                raise ValueError(f"文件大小不匹配: expected={expected_size}, actual={actual_size}")
+                raise ValueError(
+                    f"文件大小不匹配: expected={expected_size}, actual={actual_size}"
+                )
 
             actual_sha256 = self.sha256_file(tmp_path)
             if actual_sha256 != expected_sha256.lower():
@@ -153,7 +163,13 @@ class FontManager:
         local_manifest = self.read_local_manifest()
         try:
             remote_manifest = await asyncio.to_thread(self.fetch_manifest)
-        except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as e:
+        except (
+            HTTPError,
+            URLError,
+            TimeoutError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as e:
             logger.error(f"[AntiRevoke] 获取字体 manifest 失败: {e}")
             return local_manifest is not None
         except Exception as e:

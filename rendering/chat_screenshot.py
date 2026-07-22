@@ -19,20 +19,21 @@ def set_font_dir(path: Path) -> None:
     global FONT_DIR
     FONT_DIR = path
 
+
 EMOJI_PATTERN = re.compile(
     "["
-    "\U0001F1E6-\U0001F1FF"
-    "\U0001F300-\U0001F5FF"
-    "\U0001F600-\U0001F64F"
-    "\U0001F680-\U0001F6FF"
-    "\U0001F700-\U0001F77F"
-    "\U0001F780-\U0001F7FF"
-    "\U0001F800-\U0001F8FF"
-    "\U0001F900-\U0001F9FF"
-    "\U0001FA00-\U0001FAFF"
-    "\U00002702-\U000027B0"
-    "\U000024C2-\U000024FF"
-    "\U00002600-\U000026FF"
+    "\U0001f1e6-\U0001f1ff"
+    "\U0001f300-\U0001f5ff"
+    "\U0001f600-\U0001f64f"
+    "\U0001f680-\U0001f6ff"
+    "\U0001f700-\U0001f77f"
+    "\U0001f780-\U0001f7ff"
+    "\U0001f800-\U0001f8ff"
+    "\U0001f900-\U0001f9ff"
+    "\U0001fa00-\U0001faff"
+    "\U00002702-\U000027b0"
+    "\U000024c2-\U000024ff"
+    "\U00002600-\U000026ff"
     "]+",
     flags=re.UNICODE,
 )
@@ -48,6 +49,7 @@ def _patch_emoji_unicode_codes() -> None:
     unicode_codes = importlib.import_module("emoji.unicode_codes")
 
     if not hasattr(unicode_codes, "get_emoji_unicode_dict"):
+
         def get_emoji_unicode_dict(lang: str):
             emoji_data = getattr(emoji_module, "EMOJI_DATA", {}) or {}
             return {
@@ -91,7 +93,9 @@ def _get_pilmoji_class():
 def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     # 优先级 1: CDN 下载的字体
     if FONT_DIR is not None:
-        cdn_path = FONT_DIR / ("NotoSansSC-Bold.ttf" if bold else "NotoSansSC-Regular.ttf")
+        cdn_path = FONT_DIR / (
+            "NotoSansSC-Bold.ttf" if bold else "NotoSansSC-Regular.ttf"
+        )
         if cdn_path.exists():
             try:
                 return ImageFont.truetype(str(cdn_path), size)
@@ -150,7 +154,9 @@ def wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[s
     return lines
 
 
-def draw_rounded_rectangle(draw: ImageDraw.ImageDraw, xy, corner_radius, fill=None, outline=None):
+def draw_rounded_rectangle(
+    draw: ImageDraw.ImageDraw, xy, corner_radius, fill=None, outline=None
+):
     draw.rounded_rectangle(xy, radius=corner_radius, fill=fill, outline=outline)
 
 
@@ -158,10 +164,19 @@ def make_italic(image: Image.Image, skew_factor: float = 0.1) -> Image.Image:
     width, height = image.size
     new_width = width + int(height * abs(skew_factor))
     matrix = (1, skew_factor, 0, 0, 1, 0)
-    return image.transform((new_width, height), Image.AFFINE, matrix, resample=Image.BICUBIC)
+    return image.transform(
+        (new_width, height), Image.AFFINE, matrix, resample=Image.BICUBIC
+    )
 
 
-def _draw_text(image: Image.Image, position: tuple[int, int], text: str, font, fill, emoji_offset_y: int = 0) -> None:
+def _draw_text(
+    image: Image.Image,
+    position: tuple[int, int],
+    text: str,
+    font,
+    fill,
+    emoji_offset_y: int = 0,
+) -> None:
     pilmoji_class = _get_pilmoji_class()
     if pilmoji_class:
         with pilmoji_class(image, emoji_position_offset=(0, emoji_offset_y)) as pilmoji:
@@ -222,7 +237,14 @@ def make_dialog_box(text: str, name_w: int) -> Image.Image:
 
     emoji_offset_y = max(1, int(descent * 0.9))
     for line in lines:
-        _draw_text(box, (text_start_x, current_y), line, font, "black", emoji_offset_y=emoji_offset_y)
+        _draw_text(
+            box,
+            (text_start_x, current_y),
+            line,
+            font,
+            "black",
+            emoji_offset_y=emoji_offset_y,
+        )
         current_y += line_height + line_spacing
 
     return box
@@ -288,8 +310,18 @@ def render_chat_screenshot(
 
         n_visual_top = (lv_h + 40 - n_h) // 2
         p_visual_top = n_visual_top + n_h - p_h
-        lv_temp_draw.text((20 - p_bbox[0], p_visual_top - p_bbox[1]), lv_prefix, font=lv_prefix_font, fill="white")
-        lv_temp_draw.text((20 + p_w + 4 - n_bbox[0], n_visual_top - n_bbox[1]), lv_num, font=lv_num_font, fill="white")
+        lv_temp_draw.text(
+            (20 - p_bbox[0], p_visual_top - p_bbox[1]),
+            lv_prefix,
+            font=lv_prefix_font,
+            fill="white",
+        )
+        lv_temp_draw.text(
+            (20 + p_w + 4 - n_bbox[0], n_visual_top - n_bbox[1]),
+            lv_num,
+            font=lv_num_font,
+            fill="white",
+        )
 
         lv_italic_img = make_italic(lv_temp_img, skew_factor=0.1)
         bbox = lv_italic_img.getbbox()
@@ -350,7 +382,9 @@ def render_chat_screenshot(
         label_h = content_h + 20
         label_img = Image.new("RGBA", (int(label_w), int(label_h)), (0, 0, 0, 0))
         label_draw = ImageDraw.Draw(label_img)
-        draw_rounded_rectangle(label_draw, (0, 0, label_w, label_h), 12, fill=label_bg_color)
+        draw_rounded_rectangle(
+            label_draw, (0, 0, label_w, label_h), 12, fill=label_bg_color
+        )
 
         current_x = (label_w - content_w) / 2
         lv_y = (label_h - lv_italic_img.height) / 2
@@ -377,7 +411,14 @@ def render_chat_screenshot(
 
     name_draw_y = 20 + (35 - name_h) // 2
     emoji_offset_y = max(1, int(name_font.getmetrics()[1] * 0.6))
-    _draw_text(canvas, (name_x, name_draw_y), safe_name, name_font, "#868894", emoji_offset_y=emoji_offset_y)
+    _draw_text(
+        canvas,
+        (name_x, name_draw_y),
+        safe_name,
+        name_font,
+        "#868894",
+        emoji_offset_y=emoji_offset_y,
+    )
 
     output = io.BytesIO()
     canvas.convert("RGB").save(output, format="JPEG", quality=90)
@@ -399,11 +440,15 @@ async def get_avatar(user_id: str) -> bytes | None:
         return None
 
 
-async def get_member_rich_info(client, group_id: int, user_id: int, fallback_name: str = "") -> dict:
+async def get_member_rich_info(
+    client, group_id: int, user_id: int, fallback_name: str = ""
+) -> dict:
     info = None
     try:
         if hasattr(client, "get_group_member_info"):
-            info = await client.get_group_member_info(group_id=group_id, user_id=user_id, no_cache=True)
+            info = await client.get_group_member_info(
+                group_id=group_id, user_id=user_id, no_cache=True
+            )
     except TypeError:
         info = await client.get_group_member_info(group_id=group_id, user_id=user_id)
     except Exception:
@@ -426,7 +471,10 @@ async def get_member_rich_info(client, group_id: int, user_id: int, fallback_nam
         "role": info.get("role", "member"),
         "level": int(info.get("level", 0) or 0),
         "title": info.get("title", "") or "",
-        "nickname": info.get("card") or info.get("nickname") or fallback_name or str(user_id),
+        "nickname": info.get("card")
+        or info.get("nickname")
+        or fallback_name
+        or str(user_id),
     }
 
 
@@ -449,7 +497,9 @@ async def generate_text_recall_screenshot(
         logger.warning(f"[AntiRevoke] 截图: 获取头像失败 (user_id={user_id})")
         return None
 
-    info = await get_member_rich_info(client, group_id, user_id, fallback_name=fallback_name)
+    info = await get_member_rich_info(
+        client, group_id, user_id, fallback_name=fallback_name
+    )
     try:
         return render_chat_screenshot(
             name=info["nickname"],
