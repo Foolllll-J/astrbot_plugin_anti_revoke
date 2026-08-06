@@ -70,14 +70,36 @@ def get_value(obj, key, default=None):
         return default
 
 
+COMPONENT_MAP = {
+    "Plain": Comp.Plain,
+    "Text": Comp.Plain,
+    "Image": Comp.Image,
+    "Face": Comp.Face,
+    "At": Comp.At,
+    "Video": Comp.Video,
+    "Record": Comp.Record,
+    "File": Comp.File,
+    "Json": Comp.Json,
+    "Reply": Comp.Reply,
+}
+
+
 def _serialize_components(components: list) -> List[Dict]:
     serialized_list = []
     for comp in components:
         try:
+            comp_type_name = getattr(comp.type, "name", "unknown")
+            if comp_type_name == "Reply":
+                serialized_list.append(
+                    {
+                        "type": "Reply",
+                        "id": str(getattr(comp, "id", "") or ""),
+                    }
+                )
+                continue
             comp_dict = {
                 k: v for k, v in comp.__dict__.items() if not k.startswith("_")
             }
-            comp_type_name = getattr(comp.type, "name", "unknown")
             comp_dict["type"] = comp_type_name
             serialized_list.append(comp_dict)
         except Exception:
@@ -87,17 +109,6 @@ def _serialize_components(components: list) -> List[Dict]:
 
 def _deserialize_components(comp_dicts: List[Dict]) -> List:
     components = []
-    COMPONENT_MAP = {
-        "Plain": Comp.Plain,
-        "Text": Comp.Plain,
-        "Image": Comp.Image,
-        "Face": Comp.Face,
-        "At": Comp.At,
-        "Video": Comp.Video,
-        "Record": Comp.Record,
-        "File": Comp.File,
-        "Json": Comp.Json,
-    }
     for comp_dict in comp_dicts:
         data_to_construct = comp_dict.copy()
         comp_type_name = data_to_construct.pop("type", None)
@@ -190,10 +201,18 @@ async def _process_component_and_get_gocq_part(
     local_files_to_cleanup: List[str],
     local_file_map: Dict = None,
     show_qq_in_at: bool = False,
+    include_reply: bool = False,
 ) -> List[Dict]:
     gocq_parts = []
     comp_type_name = getattr(comp.type, "name", "unknown")
-    if comp_type_name in ["Plain", "Text"]:
+    if comp_type_name == "Reply":
+        if include_reply:
+            reply_id = getattr(comp, "id", None)
+            if reply_id is not None:
+                gocq_parts.append(
+                    {"type": "reply", "data": {"id": str(reply_id)}}
+                )
+    elif comp_type_name in ["Plain", "Text"]:
         text = getattr(comp, "text", "")
         if text:
             gocq_parts.append({"type": "text", "data": {"text": text}})
@@ -910,11 +929,6 @@ class AntiRevoke(Star):
             if isinstance(message_obj, list)
             else []
         )
-        components = [
-            comp
-            for comp in components
-            if getattr(comp.type, "name", "unknown") != "Reply"
-        ]
         if not components:
             return None
         component_types = [getattr(comp.type, "name", "unknown") for comp in components]
@@ -1638,6 +1652,7 @@ class AntiRevoke(Star):
                         self.temp_path,
                         local_files_to_cleanup,
                         local_file_map,
+                        include_reply=True,
                     )
                     segments.extend(parts)
             if not segments:
@@ -1872,18 +1887,7 @@ class AntiRevoke(Star):
                     cached_components_data = cached_data.get("components", [])
 
                     unsupported_types = set()
-                    supported_types_set = {
-                        "Plain",
-                        "Text",
-                        "Image",
-                        "Face",
-                        "At",
-                        "Video",
-                        "Record",
-                        "Json",
-                        "File",
-                        "Forward",
-                    }
+                    supported_types_set = set(COMPONENT_MAP.keys()) | {"Forward"}
                     for comp_dict in cached_components_data:
                         comp_type_name = comp_dict.get("type")
                         if comp_type_name not in supported_types_set:
