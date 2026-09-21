@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 import traceback
 import json
@@ -209,9 +210,7 @@ async def _process_component_and_get_gocq_part(
         if include_reply:
             reply_id = getattr(comp, "id", None)
             if reply_id is not None:
-                gocq_parts.append(
-                    {"type": "reply", "data": {"id": str(reply_id)}}
-                )
+                gocq_parts.append({"type": "reply", "data": {"id": str(reply_id)}})
     elif comp_type_name in ["Plain", "Text"]:
         text = getattr(comp, "text", "")
         if text:
@@ -242,7 +241,7 @@ async def _process_component_and_get_gocq_part(
                 logger.error(f"[AntiRevoke] ❌ 图片转Base64失败: {e}")
                 # 降级重试：如果Base64失败，尝试使用文件路径
                 gocq_parts.append(
-                    {"type": "image", "data": {"file": f"file:///{local_path}"}}
+                    {"type": "image", "data": {"file": Path(local_path).as_uri()}}
                 )
         else:
             gocq_parts.append({"type": "text", "data": {"text": "[图片转发失败]"}})
@@ -255,7 +254,7 @@ async def _process_component_and_get_gocq_part(
         elif cached_video_path_str and Path(cached_video_path_str).exists():
             absolute_path = str(Path(cached_video_path_str).absolute())
             gocq_parts.append(
-                {"type": "video", "data": {"file": f"file:///{absolute_path}"}}
+                {"type": "video", "data": {"file": Path(absolute_path).as_uri()}}
             )
         else:
             logger.error(
@@ -278,7 +277,7 @@ async def _process_component_and_get_gocq_part(
                 logger.error(f"[AntiRevoke] ❌ 语音转Base64失败: {e}")
                 # 降级重试：如果Base64失败，尝试使用文件路径
                 gocq_parts.append(
-                    {"type": "record", "data": {"file": f"file:///{absolute_path}"}}
+                    {"type": "record", "data": {"file": Path(absolute_path).as_uri()}}
                 )
         else:
             logger.error(
@@ -311,7 +310,7 @@ async def _process_component_and_get_gocq_part(
                 {
                     "type": "file",
                     "data": {
-                        "file": f"file:///{absolute_path}",
+                        "file": Path(absolute_path).as_uri(),
                         "name": original_filename,
                     },
                 }
@@ -1253,9 +1252,15 @@ class AntiRevoke(Star):
                         if not original_filename or len(original_filename) < 5:
                             original_filename = f"{timestamp_ms}.mp4"
 
+                        # 视频缓存文件名会拼进 file:// URI，需过滤特殊字符防止客户端解析失败
+                        safe_name = (
+                            re.sub(r"[^\w.\-\u4e00-\u9fff]", "_", original_filename)[
+                                -80:
+                            ]
+                            or "video.mp4"
+                        )
                         dest_path = (
-                            self.video_cache_path
-                            / f"{timestamp_ms}_{original_filename}"
+                            self.video_cache_path / f"{timestamp_ms}_{safe_name}"
                         )
                         if await self._download_video_from_url(download_url, dest_path):
                             file_cache[file_id] = str(dest_path.absolute())
@@ -1376,8 +1381,15 @@ class AntiRevoke(Star):
                         ):
                             original_filename = f"未知文件_{timestamp_ms}.dat"
 
+                        # QQ 文件段自带的名称常为含 % $ ` 等的内部哈希名，直接落盘会污染 file:// URI
+                        safe_name = (
+                            re.sub(r"[^\w.\-\u4e00-\u9fff]", "_", original_filename)[
+                                -80:
+                            ]
+                            or "file.dat"
+                        )
                         permanent_path = (
-                            self.file_cache_path / f"{timestamp_ms}_{original_filename}"
+                            self.file_cache_path / f"{timestamp_ms}_{safe_name}"
                         )
                         shutil.copy(temp_file_path, permanent_path)
 

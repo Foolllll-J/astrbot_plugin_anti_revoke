@@ -1,7 +1,7 @@
 name: astrbot_plugin_anti_revoke
 display_name: QQ 防撤回
 desc: 支持监控 QQ 群被撤回的消息并将撤回通知发送至目标会话。
-version: v1.4.4
+version: v1.4.5
 author: Foolllll
 author_url: https://github.com/Foolllll-J
 repo: https://github.com/Foolllll-J/astrbot_plugin_anti_revoke
