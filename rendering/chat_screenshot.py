@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 import aiohttp
-from astrbot import logger
+from astrbot.api import logger
 from PIL import Image, ImageDraw, ImageFont
 
 

@@ -15,10 +15,9 @@ from astrbot.api import logger
 from astrbot.api.star import StarTools
 from astrbot.api import message_components as Comp
 from astrbot.api.star import Context, Star
-from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.platform import MessageType
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from astrbot.api.event.filter import PlatformAdapterType
 from .rendering.chat_screenshot import (
     generate_text_recall_screenshot,
     set_font_dir as set_screenshot_font_dir,
@@ -149,6 +148,30 @@ def _build_original_image_urls(raw_message: dict) -> list[str | None]:
                         url if url.startswith(("http://", "https://")) else None
                     )
     return urls
+
+
+def _build_original_video_urls(raw_message: dict) -> dict[str, str]:
+    """从 raw_message 中提取 Video 段的 HTTP URL，按 file 字段索引。"""
+    urls = {}
+    if isinstance(raw_message, dict):
+        msg_list = raw_message.get("message", [])
+        if isinstance(msg_list, list):
+            for seg in msg_list:
+                if isinstance(seg, dict) and seg.get("type") == "video":
+                    data = seg.get("data", {}) or {}
+                    file_val = data.get("file", "") or ""
+                    url = data.get("url", "") or ""
+                    if file_val and url.startswith(("http://", "https://")):
+                        urls[file_val] = url
+    return urls
+
+
+def _pick_video_url(comp, raw_video_urls: dict[str, str], file_id: str) -> str | None:
+    """按组件 url → raw_message url 的顺序取可下载的视频地址。"""
+    for candidate in (getattr(comp, "url", None), raw_video_urls.get(file_id)):
+        if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
+            return candidate
+    return None
 
 
 async def _download_and_cache_image(
@@ -403,6 +426,7 @@ class AntiRevoke(Star):
 
         self._cached_self_id: str | None = None
         self._cache_tasks: dict[str, CacheTaskState] = {}
+        self._video_fallback_notified = False
         self._cleanup_cache_on_startup()
         asyncio.create_task(self._cleanup_kv_data())
 
@@ -1193,6 +1217,7 @@ class AntiRevoke(Star):
 
         local_file_map = {}
         original_image_urls = _build_original_image_urls(raw_message)
+        raw_video_urls = _build_original_video_urls(raw_message)
         original_image_idx = -1
         has_downloadable_content = any(
             getattr(comp.type, "name", "") in ["Image", "Video", "Record", "File"]
@@ -1219,15 +1244,30 @@ class AntiRevoke(Star):
                             continue
 
                     try:
-                        ret = await client.api.call_action(
-                            "get_file", **{"file_id": file_id}
-                        )
-                        download_url = ret.get("url")
+                        download_url = None
+                        file_size_from_api = None
+                        try:
+                            ret = await client.api.call_action(
+                                "get_file", **{"file_id": file_id}
+                            )
+                            download_url = ret.get("url")
+                            file_size_from_api = ret.get("file_size")
+                        except Exception as exc:
+                            logger.debug(f"[{self.instance_id}] get_file 不可用: {exc}")
+
+                        if not download_url:
+                            download_url = _pick_video_url(
+                                comp, raw_video_urls, file_id
+                            )
+                            # 部分协议端（如 SnowLuma）的 get_file 不解析视频 id，只提示一次避免刷屏
+                            if download_url and not self._video_fallback_notified:
+                                self._video_fallback_notified = True
+                                logger.warning(
+                                    f"[{self.instance_id}] 当前协议端的 get_file 不支持视频，已改为按消息段 URL 下载（仅提示一次）"
+                                )
                         if not download_url:
                             file_cache[file_id] = "Error: API did not return a URL."
                             continue
-
-                        file_size_from_api = ret.get("file_size")
                         if file_size_from_api and self.file_size_threshold_mb > 0:
                             try:
                                 file_size_int = (
