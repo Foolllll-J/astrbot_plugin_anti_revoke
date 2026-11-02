@@ -174,6 +174,22 @@ def _pick_video_url(comp, raw_video_urls: dict[str, str], file_id: str) -> str |
     return None
 
 
+def _group_parts_by_video(parts: list) -> list[list]:
+    """按原顺序切段，video 段各自独占一组（协议端要求视频单独成条）。"""
+    groups, current = [], []
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") == "video":
+            if current:
+                groups.append(current)
+                current = []
+            groups.append([part])
+        else:
+            current.append(part)
+    if current:
+        groups.append(current)
+    return groups
+
+
 async def _download_and_cache_image(
     session: aiohttp.ClientSession, component: Comp.Image, temp_path: Path
 ) -> str:
@@ -1593,6 +1609,16 @@ class AntiRevoke(Star):
         else:
             await client.send_group_msg(group_id=int(target_id_str), message=message)
 
+    async def _send_parts(self, client, target_type: str, target_id_str: str, parts):
+        """按段发送：video 段在协议端必须独占一条消息，其余段合并发送。"""
+        if not isinstance(parts, list) or not parts:
+            await self._send_to_target(client, target_type, target_id_str, parts)
+            return
+        for index, group in enumerate(_group_parts_by_video(parts)):
+            if index:
+                await asyncio.sleep(0.5)
+            await self._send_to_target(client, target_type, target_id_str, group)
+
     def _message_to_plain_text(self, message) -> str:
         """将 go-cqhttp 消息数组压缩成便于兜底通知的纯文本。"""
         if isinstance(message, str):
@@ -1673,7 +1699,7 @@ class AntiRevoke(Star):
     ):
         """优先发送原始内容，失败时降级为纯文本提醒。"""
         try:
-            await self._send_to_target(client, target_type, target_id_str, message)
+            await self._send_parts(client, target_type, target_id_str, message)
             return True
         except Exception as error:
             await self._notify_send_failure(
@@ -1709,15 +1735,8 @@ class AntiRevoke(Star):
                     segments.extend(parts)
             if not segments:
                 return
-            node = {
-                "type": "node",
-                "data": {
-                    "name": member_nickname,
-                    "uin": int(sender_id),
-                    "time": int(timestamp or 0),
-                    "content": segments,
-                },
-            }
+            groups = _group_parts_by_video(segments)
+
             action = (
                 "send_private_forward_msg"
                 if target_type == "private"
@@ -1728,7 +1747,19 @@ class AntiRevoke(Star):
                 if target_type == "private"
                 else {"group_id": int(target_id_str)}
             )
-            await client.api.call_action(action, messages=[node], **params)
+            nodes = [
+                {
+                    "type": "node",
+                    "data": {
+                        "name": member_nickname,
+                        "uin": int(sender_id),
+                        "time": int(timestamp or 0),
+                        "content": group,
+                    },
+                }
+                for group in groups
+            ]
+            await client.api.call_action(action, messages=nodes, **params)
         except Exception as e:
             logger.warning(
                 f"[{self.instance_id}] 伪造合并转发发送失败 ({target_type}/{target_id_str}): {e}"
@@ -2142,7 +2173,8 @@ class AntiRevoke(Star):
                                     )
                                 )
                                 final_parts_to_send = content_parts
-                                if not other_components:
+                                # video 段必须独占一条消息（否则 retcode 1400），且通知头已含发送者
+                                if not other_components and comp_type_name != "Video":
                                     prefix_part = [
                                         {
                                             "type": "text",
